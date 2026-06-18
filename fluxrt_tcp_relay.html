@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>FluxRT TCP Relay</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; width: 512px; height: 512px; overflow: hidden; }
+  #output-canvas { width: 512px; height: 512px; display: block; }
+  #input-canvas { display: none; }
+  #status {
+    position: absolute; inset: 0; z-index: 101;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: none; transition: opacity 0.3s ease-out;
+  }
+  #status.hidden { opacity: 0; }
+  #status-text {
+    color: rgba(255,255,255,0.9);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 22px; font-weight: 500; text-align: center;
+    text-shadow: 0 2px 6px rgba(0,0,0,0.5);
+  }
+</style>
+</head>
+<body>
+  <canvas id="output-canvas" width="512" height="512"></canvas>
+  <canvas id="input-canvas" width="512" height="512"></canvas>
+  <div id="status"><div id="status-text">Connecting...</div></div>
+
+<script>
+/*
+ * FluxRT TCP relay page.
+ *
+ * Replaces the original WHIP/WHEP (WebRTC) relay with plain WebSocket
+ * frame I/O, so it works over RunPod's TCP-only networking.
+ *
+ * Two WebSocket connections, same bridging role the original relay had:
+ *   1. LOCAL (to TD): receives input frames (JPEG) that TD's web_server
+ *      DAT pushes from stream_source — identical mechanism to the
+ *      original relay's input path. Painted onto #input-canvas.
+ *   2. REMOTE (to FluxRT server): the input frames are forwarded here as
+ *      binary JPEG; processed JPEG frames come back and are painted onto
+ *      #output-canvas, which web_render captures for display in TD.
+ *
+ * Self-throttling: a new frame is only forwarded to the remote server
+ * once the previous processed frame has come back (FRAME_IN_FLIGHT flag).
+ * Same reasoning as the TD-Python version — never flood the link, and
+ * keep input/output frames unambiguously paired.
+ *
+ * Template variables filled in by the extension before serving:
+ *   {{LOCAL_WS_PORT}} - TD's local web_server port (input frames in)
+ *   {{REMOTE_WS_URL}} - full ws:// URL of the FluxRT server's /ws endpoint
+ */
+
+const LOCAL_WS_URL = "ws://" + window.location.hostname + ":{{LOCAL_WS_PORT}}/ws";
+const REMOTE_WS_URL = "{{REMOTE_WS_URL}}";
+
+const statusEl = document.getElementById("status");
+const statusText = document.getElementById("status-text");
+function setStatus(msg) {
+  console.log("[FluxRT relay]", msg);
+  statusText.textContent = msg;
+}
+function hideStatus() { statusEl.classList.add("hidden"); }
+
+// --- Output canvas: paint processed frames coming back from server ---
+// Reuses the original relay's bitmaprenderer fast-path for painting
+// JPEG frames with minimal overhead.
+const outCanvas = document.getElementById("output-canvas");
+let outCtx, useBitmapRenderer;
+(function initOutputCanvas() {
+  useBitmapRenderer = !!outCanvas.getContext("bitmaprenderer");
+  outCtx = useBitmapRenderer
+    ? outCanvas.getContext("bitmaprenderer")
+    : outCanvas.getContext("2d");
+  if (!useBitmapRenderer) {
+    outCtx.fillStyle = "#000";
+    outCtx.fillRect(0, 0, 512, 512);
+  }
+})();
+
+let paintPending = null;
+let paintBusy = false;
+function paintProcessedFrame(arrayBuffer) {
+  paintPending = arrayBuffer;
+  drainPaint();
+}
+function drainPaint() {
+  if (!paintPending || paintBusy) return;
+  const buf = paintPending;
+  paintPending = null;
+  paintBusy = true;
+  createImageBitmap(new Blob([buf], { type: "image/jpeg" }))
+    .then((bmp) => {
+      if (useBitmapRenderer) {
+        outCtx.transferFromImageBitmap(bmp);
+      } else {
+        outCtx.drawImage(bmp, 0, 0, 512, 512);
+        bmp.close();
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      paintBusy = false;
+      if (paintPending) drainPaint();
+    });
+}
+
+// --- Input canvas: latest input frame received from TD locally ---
+const inCanvas = document.getElementById("input-canvas");
+const inCtx = inCanvas.getContext("2d");
+let latestInputJpeg = null; // ArrayBuffer of the most recent input frame
+
+// --- Remote connection (to FluxRT server) ---
+// DECOUPLED design (matches server's two independent loops and FluxRT's
+// shared-memory model): we send input frames on a steady timer, and
+// separately paint whatever processed frames arrive. We do NOT wait for
+// a processed frame before sending the next input — coupling those was
+// what fed the model sparse, far-apart frames and made RIFE glitch.
+let remoteWs = null;
+
+// Send input to the server at this rate, independent of output. Matches
+// the server's OUTPUT_FPS and the demo's ~25fps input cadence. The model
+// consumes the latest input at its own pace; oversending just means it
+// always has a fresh frame, undersending would starve it.
+const SEND_FPS = 25;
+let lastSendTime = 0;
+
+function connectRemote() {
+  setStatus("Connecting to FluxRT server...");
+  remoteWs = new WebSocket(REMOTE_WS_URL);
+  remoteWs.binaryType = "arraybuffer";
+
+  remoteWs.onopen = () => {
+    setStatus("Connected, streaming...");
+    setTimeout(hideStatus, 500);
+    pumpFrames();
+  };
+  remoteWs.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      // A processed frame arrived — just paint it. No coupling to sends.
+      paintProcessedFrame(ev.data);
+    }
+    // Text messages (e.g. prompt-update acks) ignored.
+  };
+  remoteWs.onclose = () => {
+    setStatus("Disconnected, reconnecting...");
+    statusEl.classList.remove("hidden");
+    setTimeout(connectRemote, 1000);
+  };
+  remoteWs.onerror = () => {
+    setStatus("Connection error");
+  };
+}
+
+// Send the latest input frame at a steady SEND_FPS, regardless of
+// whether/when processed frames come back.
+function pumpFrames() {
+  const now = performance.now();
+  if (
+    remoteWs &&
+    remoteWs.readyState === WebSocket.OPEN &&
+    latestInputJpeg &&
+    now - lastSendTime >= 1000 / SEND_FPS
+  ) {
+    lastSendTime = now;
+    remoteWs.send(latestInputJpeg);
+  }
+  requestAnimationFrame(pumpFrames);
+}
+
+// Allow the extension to push prompt updates through the same socket.
+window.sendPrompt = function (promptText) {
+  if (remoteWs && remoteWs.readyState === WebSocket.OPEN) {
+    remoteWs.send(JSON.stringify({ prompt: promptText }));
+  }
+};
+
+// --- Local connection (from TD): receive input frames ---
+function connectLocal() {
+  const localWs = new WebSocket(LOCAL_WS_URL);
+  localWs.binaryType = "arraybuffer";
+  localWs.onopen = () => console.log("[FluxRT relay] local input WS connected");
+  localWs.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      // Newest input frame from TD. Keep only the latest — if FluxRT is
+      // behind, we skip stale input frames rather than queueing them.
+      latestInputJpeg = ev.data;
+    }
+  };
+  localWs.onclose = () => {
+    console.log("[FluxRT relay] local input WS closed, reconnecting...");
+    setTimeout(connectLocal, 1000);
+  };
+}
+
+// Start both connections.
+connectLocal();
+connectRemote();
+</script>
+</body>
+</html>
