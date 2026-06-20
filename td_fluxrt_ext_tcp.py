@@ -214,6 +214,13 @@ class FluxRTExt:
         self._set_state("STREAMING")
         self.UpdateStatusText("Streaming")
 
+        # Apply the current prompt now that we're streaming. Without this the
+        # initial prompt is never sent (OnParameterChange only fires on a
+        # *change*), so the model runs with its built-in default until you edit
+        # the field. NOTE: live prompt edits still require the Parameter Execute
+        # DAT wired to OnParameterChange (see README wiring).
+        self._send_prompt(self.params.Prompt)
+
     def Stop(self):
         frame_timer = self.ownerComp.op('frame_timer')
         if frame_timer:
@@ -515,14 +522,20 @@ function connectRemote() {
   };
 }
 
-// Send the latest input frame at a steady SEND_FPS, regardless of
-// whether/when processed frames come back.
+// Send the latest input frame, but ONLY once the socket has drained the
+// previous one (bufferedAmount === 0). On a fast link this runs at the full
+// SEND_FPS; on a slower/proxied link (e.g. through Modal's wss edge) it
+// automatically backs off and skips stale frames — latestInputJpeg is always
+// the newest — so the send queue, and therefore end-to-end latency, can't
+// pile up. Without this guard a fixed 25fps over a link that can't keep up
+// makes the browser buffer frames for seconds: classic bufferbloat.
 function pumpFrames() {
   const now = performance.now();
   if (
     remoteWs &&
     remoteWs.readyState === WebSocket.OPEN &&
     latestInputJpeg &&
+    remoteWs.bufferedAmount === 0 &&
     now - lastSendTime >= 1000 / SEND_FPS
   ) {
     lastSendTime = now;

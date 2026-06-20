@@ -11,6 +11,10 @@ Frames travel over a plain **WebSocket (TCP)**, not WebRTC — see
 makes it work on TCP-only GPU hosts (e.g. RunPod Pods) and even through an SSH /
 VS Code tunnel.
 
+> **Deploying on Modal instead of a RunPod Pod?** See **[MODAL.md](MODAL.md)** —
+> the same `server-tcp.py`, packaged as a Modal app on a warm GPU and served
+> over `wss://…modal.run`. No VM to provision, no TCP port to expose, no tunnel.
+
 ---
 
 ## Architecture
