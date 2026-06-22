@@ -32,9 +32,17 @@ class BenchmarkWsHelpersTest(unittest.TestCase):
         self.assertEqual(summary["receive_window_s"], 1.0)
         self.assertEqual(summary["send_fps"], 2.0)
         self.assertEqual(summary["receive_fps"], 1.0)
+        self.assertEqual(summary["bytes_sent"], 200)
+        self.assertEqual(summary["bytes_received"], 200)
+        self.assertEqual(summary["avg_sent_frame_bytes"], 100.0)
+        self.assertEqual(summary["avg_received_frame_bytes"], 200.0)
         self.assertEqual(summary["sent_minus_received_frames"], 1)
         self.assertEqual(summary["latest_send_age_ms"]["count"], 1)
         self.assertEqual(summary["latest_send_age_ms"]["mean_ms"], 250.0)
+
+    def test_average_bytes_handles_empty_counts(self):
+        self.assertEqual(benchmark_ws.average_bytes(0, 0), 0.0)
+        self.assertEqual(benchmark_ws.average_bytes(100, 4), 25.0)
 
     def test_recorder_fps_ignores_connection_delay_and_drain(self):
         recorder = benchmark_ws.BenchmarkRecorder()

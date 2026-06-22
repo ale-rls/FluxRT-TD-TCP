@@ -19,7 +19,9 @@ def load_server_module():
     numpy.ndarray = object
 
     sys.modules.setdefault("aiohttp", aiohttp)
-    sys.modules.setdefault("cv2", types.ModuleType("cv2"))
+    cv2 = types.ModuleType("cv2")
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    sys.modules.setdefault("cv2", cv2)
     sys.modules.setdefault("numpy", numpy)
 
     path = Path(__file__).with_name("server-tcp.py")
@@ -119,6 +121,41 @@ class WorkConfigTest(unittest.TestCase):
                     )
                 with self.assertRaises(ValueError):
                     server_tcp.build_work_config(input_fps=float(value), environ={})
+
+
+class JpegConfigTest(unittest.TestCase):
+    def test_default_jpeg_config_preserves_existing_output_quality(self):
+        config = server_tcp.build_jpeg_config(environ={})
+
+        self.assertEqual(config.output_quality, 70)
+        self.assertEqual(
+            config.output_encode_params,
+            [server_tcp.cv2.IMWRITE_JPEG_QUALITY, 70],
+        )
+
+    def test_env_and_cli_output_quality_are_supported(self):
+        config = server_tcp.build_jpeg_config(
+            output_quality=55,
+            environ={"FLUXRT_OUTPUT_JPEG_QUALITY": "60"},
+        )
+
+        self.assertEqual(config.output_quality, 55)
+
+        env_config = server_tcp.build_jpeg_config(
+            environ={"FLUXRT_OUTPUT_JPEG_QUALITY": "60"}
+        )
+        self.assertEqual(env_config.output_quality, 60)
+
+    def test_invalid_jpeg_quality_is_rejected(self):
+        for value in (0, 101, "low"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    server_tcp.build_jpeg_config(output_quality=value, environ={})
+
+        with self.assertRaises(ValueError):
+            server_tcp.build_jpeg_config(
+                environ={"FLUXRT_OUTPUT_JPEG_QUALITY": "101"}
+            )
 
 
 if __name__ == "__main__":

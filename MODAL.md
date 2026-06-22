@@ -112,11 +112,27 @@ python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
 
 Compare each run's client `send_fps`, `receive_fps`, and `latest_send_age_ms`
 p50/p95 with the server `ws stats/5s` line: `rx_fps` vs. `wrote_fps`,
-`encoded_fps` vs. `sent_fps`, `drop_in`, `drop_out`, and `hot_ms` means/p95s.
-Use the lighter preset for TouchDesigner only if the benchmark improves latency
-or steadiness enough to justify the lower send/display cadence. All benchmark
-presets keep the real TouchDesigner relay geometry, 512x512; use explicit
-`--width` and `--height` only for a separate JPEG/network/decode experiment.
+`encoded_fps` vs. `sent_fps`, `drop_in`, `drop_out`, `avg_kb`, and `hot_ms`
+means/p95s. Use the lighter preset for TouchDesigner only if the benchmark
+improves latency or steadiness enough to justify the lower send/display
+cadence. All benchmark presets keep the real TouchDesigner relay geometry,
+512x512; use explicit `--width` and `--height` only for a separate
+JPEG/network/decode experiment.
+
+For JPEG CPU/byte sweeps, keep cadence fixed and vary only quality. Set
+`SERVER_OUTPUT_JPEG_QUALITY = 70`, `60`, or `55` in `modal_app.py`, redeploy,
+then run the benchmark with the matching input quality:
+
+```bash
+python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
+  --benchmark-preset light --quality 55 --duration 30
+```
+
+The benchmark prints generated input JPEG bytes and average received output
+frame bytes. Pair those with Modal logs for server `avg_kb`,
+`input_decode`, `output_encode`, `sent_fps`, and `send` p95. In
+TouchDesigner, set **Input JPEG Quality** to `quality / 100`, for example
+`0.55`, when repeating the same run through the relay.
 
 Modal only allows `routing_region` to be set when a Function is first created.
 If you already deployed this app before the `eu-west` routing change and Modal
@@ -189,15 +205,17 @@ drop the warm container.
 - **Runtime stats.** The backend logs one `ws stats/5s` line per connected
   client. Use `rx_fps` vs. `wrote_fps` to compare receive pressure with
   accepted FluxRT input cadence, and `encoded_fps` vs. `sent_fps` plus
-  `drop_out` to spot websocket backpressure. `hot_ms` fields are
-  `mean/p95/count` latencies in milliseconds for `input_decode`,
+  `drop_out` to spot websocket backpressure. The `avg_kb` values show average
+  incoming, encoded, and sent frame sizes for the same window. `hot_ms` fields
+  are `mean/p95/count` latencies in milliseconds for `input_decode`,
   `input_crop_copy`, `output_read`, `output_encode`, and websocket `send`,
   making Modal `modal.run` vs. `modal.host` tunnel runs directly comparable.
 - **WebSocket lifetime.** A connection is capped by the function `timeout` (set
   to 6 h). If it's recycled, the relay auto-reconnects within ~1 s.
 - **Tuning.** Server-side cadence presets live near the top of `modal_app.py`:
   `SERVER_WORK_PRESET = "default"`, `"light"`, or `"low"`, with optional
-  `SERVER_OUTPUT_FPS` and `SERVER_INPUT_FPS` overrides. FluxRT model tuning
+  `SERVER_OUTPUT_FPS` and `SERVER_INPUT_FPS` overrides. Server output JPEG
+  quality is `SERVER_OUTPUT_JPEG_QUALITY`, default `70`. FluxRT model tuning
   (`interpolation_exp`, `target_fps`, `resolution`) still lives in
   `configs/stream_processor_config.json` inside the FluxRT clone. To override
   FluxRT's own config, edit a local copy and add it to the image

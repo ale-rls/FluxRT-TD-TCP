@@ -52,6 +52,7 @@ USE_INT8 = False
 SERVER_WORK_PRESET = "default"
 SERVER_OUTPUT_FPS = None
 SERVER_INPUT_FPS = None
+SERVER_OUTPUT_JPEG_QUALITY = 70
 
 # Region for the GPU container. A narrow region has Modal's higher regional
 # pricing multiplier but avoids a US GPU hop for Berlin/EU clients. Set to None
@@ -221,6 +222,8 @@ def _start_fluxrt_server():
         cmd.extend(["--output-fps", str(SERVER_OUTPUT_FPS)])
     if SERVER_INPUT_FPS is not None:
         cmd.extend(["--input-fps", str(SERVER_INPUT_FPS)])
+    if SERVER_OUTPUT_JPEG_QUALITY is not None:
+        cmd.extend(["--output-jpeg-quality", str(SERVER_OUTPUT_JPEG_QUALITY)])
     if USE_INT8:
         cmd.append("--int8")
     # server-tcp.py binds 0.0.0.0 by default — required for web_server.

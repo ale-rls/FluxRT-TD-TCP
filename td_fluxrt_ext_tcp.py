@@ -51,6 +51,7 @@ JPEG_QUALITY = 0.7  # matches JPEG_QUALITY_STREAM from the original relay
 PARAM_DEFAULTS = {
     'Serverurl': 'ws://localhost:8080/ws',  # full ws:// URL to server-tcp.py
     'Prompt': 'a person standing in a forest, cinematic lighting',
+    'Inputjpegquality': JPEG_QUALITY,
     'Active': False,
 }
 
@@ -70,6 +71,15 @@ class ParameterManager:
         val = self._get(name, default)
         return bool(val) if val is not None else default
 
+    def _get_float(self, name, default=None):
+        val = self._get(name, default)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
     @property
     def Serverurl(self):
         return self._get('Serverurl', PARAM_DEFAULTS['Serverurl'])
@@ -81,6 +91,13 @@ class ParameterManager:
     @property
     def Active(self):
         return self._get_bool('Active', False)
+
+    @property
+    def Inputjpegquality(self):
+        value = self._get_float(
+            'Inputjpegquality', PARAM_DEFAULTS['Inputjpegquality']
+        )
+        return min(1.0, max(0.05, value))
 
     def _get_page(self, name):
         for p in self.ownerComp.customPages:
@@ -106,6 +123,11 @@ class ParameterManager:
         if not hasattr(self.ownerComp.par, 'Prompt'):
             p = page.appendStr('Prompt', label='Prompt')[0]
             p.default = p.val = PARAM_DEFAULTS['Prompt']
+        if not hasattr(self.ownerComp.par, 'Inputjpegquality'):
+            p = page.appendFloat('Inputjpegquality', label='Input JPEG Quality')[0]
+            p.default = p.val = PARAM_DEFAULTS['Inputjpegquality']
+            p.normMin = 0.05
+            p.normMax = 1.0
         if not hasattr(self.ownerComp.par, 'Active'):
             p = page.appendToggle('Active', label='Active')[0]
             p.default = p.val = False
@@ -121,19 +143,23 @@ class ParameterManager:
         page.appendHeader('Controls')
         p = page.appendStr('Prompt', label='Prompt')[0]
         p.default = p.val = PARAM_DEFAULTS['Prompt']
+        p = page.appendFloat('Inputjpegquality', label='Input JPEG Quality')[0]
+        p.default = p.val = PARAM_DEFAULTS['Inputjpegquality']
+        p.normMin = 0.05
+        p.normMax = 1.0
         p = page.appendToggle('Active', label='Active')[0]
         p.default = p.val = False
 
     def update_states(self, connected):
         par = self.ownerComp.par
-        for par_name in ['Prompt', 'Active', 'Serverurl']:
+        for par_name in ['Prompt', 'Active', 'Serverurl', 'Inputjpegquality']:
             if hasattr(par, par_name):
                 getattr(par, par_name).enable = True
 
     def setup_param_exec(self):
         param_exec = self.ownerComp.op('param_exec')
         if param_exec and hasattr(param_exec.par, 'pars'):
-            param_exec.par.pars = 'Active Prompt Serverurl'
+            param_exec.par.pars = 'Active Prompt Serverurl Inputjpegquality'
 
 
 class FrameServer:
@@ -323,7 +349,9 @@ class FluxRTExt:
             return
 
         try:
-            jpeg = stream_source.saveByteArray('.jpg', quality=JPEG_QUALITY)
+            jpeg = stream_source.saveByteArray(
+                '.jpg', quality=self.params.Inputjpegquality
+            )
             dead = []
             for c in clients:
                 try:
