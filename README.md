@@ -170,11 +170,16 @@ In `server-tcp.py` / `fluxrt_tcp_relay.html`:
 - **`--input-fps` / `FLUXRT_INPUT_FPS`** — overrides the preset's FluxRT input
   tensor write cadence. `0` keeps the original uncapped latest-wins input
   behavior.
+- **`--output-jpeg-quality` / `FLUXRT_OUTPUT_JPEG_QUALITY`** — server output
+  JPEG quality, `1-100`, default `70`. Lower values reduce OpenCV encode CPU
+  and websocket bytes at the cost of display quality.
 - **`SEND_FPS`** (relay) — TouchDesigner relay input send rate, default 25.
   For a tuned show run, keep it close to the server input/output caps you chose
   to avoid oversending frames that will be dropped.
-- **`JPEG_QUALITY`** — input quality can go lower (the model transforms it
-  anyway); keep output quality higher since that's what's displayed.
+- **`Input JPEG Quality`** (TouchDesigner extension) — local
+  `stream_source.saveByteArray('.jpg')` quality, default `0.7`. Input quality
+  can usually go lower than output quality because the model transforms it
+  anyway; watch `input_decode`, `rx` average KB, and visual stability.
 
 ## Runtime stats
 
@@ -185,6 +190,7 @@ timings:
 ```
 ws stats/5s window=...s rx=... rx_fps=... wrote=... wrote_fps=...
   encoded=... encoded_fps=... sent=... sent_fps=...
+  avg_kb rx=... encoded=... sent=...
   drop_in=... drop_out=... bad_decode=...
   hot_ms input_decode=mean/p95/count
   input_crop_copy=mean/p95/count output_read=mean/p95/count
@@ -192,11 +198,12 @@ ws stats/5s window=...s rx=... rx_fps=... wrote=... wrote_fps=...
 ```
 
 For benchmarking, compare `rx_fps` with `wrote_fps` to see receive pressure
-versus accepted FluxRT input cadence, and compare `encoded_fps` with `sent_fps`
-plus `drop_out` to spot network backpressure. The `hot_ms` fields are
-`mean/p95/count` latencies in milliseconds for the server-observable stages:
-input JPEG decode, input crop/copy into FluxRT, output tensor read, JPEG encode,
-and websocket send wait.
+versus accepted FluxRT input cadence. Compare `encoded_fps` with `sent_fps`
+plus `drop_out` to spot network backpressure, and compare `avg_kb` with
+`output_encode` and `send` timings during JPEG quality sweeps. The `hot_ms`
+fields are `mean/p95/count` latencies in milliseconds for the
+server-observable stages: input JPEG decode, input crop/copy into FluxRT,
+output tensor read, JPEG encode, and websocket send wait.
 
 ## Pre-TouchDesigner benchmark
 
@@ -229,18 +236,40 @@ separate JPEG/network/decode experiment, pass explicit `--width` and `--height`
 overrides and label that run separately from cadence tuning.
 
 Client output reports elapsed time, active send/receive windows, frames
-sent/received, send/receive FPS for the active send window, the simple
-`sent_minus_received` count delta, and `latest_send_age_ms` mean/p50/p95/max.
-Connection setup and post-send receive drain do not dilute the headline FPS
-numbers. Because the server protocol intentionally does not tag frames and
-FluxRT input/output loops are decoupled, that latency is the age since the
-latest client send when a binary response arrived, not a strict per-input model
-round trip. Pair it with the server's `ws stats/5s` `hot_ms` fields to separate
-network pressure, server CPU/shared-memory costs, and FluxRT output cadence
-across runs. Compare baseline vs. `light` before opening TouchDesigner:
+sent/received, send/receive FPS for the active send window, byte totals,
+average frame bytes, the simple `sent_minus_received` count delta, and
+`latest_send_age_ms` mean/p50/p95/max. Connection setup and post-send receive
+drain do not dilute the headline FPS numbers. Because the server protocol
+intentionally does not tag frames and FluxRT input/output loops are decoupled,
+that latency is the age since the latest client send when a binary response
+arrived, not a strict per-input model round trip. Pair it with the server's
+`ws stats/5s` `hot_ms` fields to separate network pressure, server
+CPU/shared-memory costs, and FluxRT output cadence across runs. Compare
+baseline vs. `light` before opening TouchDesigner:
 
 - Client: `send_fps`, `receive_fps`, and `latest_send_age_ms` p50/p95.
 - Server: `rx_fps` vs. `wrote_fps`, `encoded_fps` vs. `sent_fps`, `drop_in`,
-  `drop_out`, and the `hot_ms` stage means/p95s.
+  `drop_out`, `avg_kb`, and the `hot_ms` stage means/p95s.
+
+To measure JPEG CPU/quality tradeoffs, keep cadence fixed and run a small
+quality sweep. Example:
+
+```bash
+python server-tcp.py --config configs/stream_processor_config.json \
+  --port 8080 --work-preset light --output-jpeg-quality 70
+python3 benchmark_ws.py ws://127.0.0.1:8080/ws \
+  --benchmark-preset light --quality 70 --duration 30
+
+python server-tcp.py --config configs/stream_processor_config.json \
+  --port 8080 --work-preset light --output-jpeg-quality 55
+python3 benchmark_ws.py ws://127.0.0.1:8080/ws \
+  --benchmark-preset light --quality 55 --duration 30
+```
+
+For each run, record the benchmark's `input_jpeg`, average sent/received frame
+bytes, `receive_fps`, and `latest_send_age_ms` p95, then pair it with server
+`avg_kb`, `input_decode`, `output_encode`, `sent_fps`, and `send` p95. In
+TouchDesigner, match the client-side part of the run by setting **Input JPEG
+Quality** to the same `quality / 100` value, for example `0.55`.
 
 ---

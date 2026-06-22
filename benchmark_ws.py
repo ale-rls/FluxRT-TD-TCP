@@ -52,6 +52,12 @@ def rate_per_second(count: int, elapsed_seconds: float) -> float:
     return count / elapsed_seconds
 
 
+def average_bytes(total_bytes: int, count: int) -> float:
+    if count <= 0:
+        return 0.0
+    return total_bytes / count
+
+
 def require_finite(value: float, name: str) -> float:
     if not math.isfinite(value):
         raise SystemExit(f"{name} must be finite")
@@ -152,6 +158,10 @@ class BenchmarkRecorder:
             ),
             "bytes_sent": self.bytes_sent,
             "bytes_received": self.bytes_received,
+            "avg_sent_frame_bytes": average_bytes(self.bytes_sent, self.sent),
+            "avg_received_frame_bytes": average_bytes(
+                self.bytes_received, self.received
+            ),
             "sent_minus_received_frames": self.sent - self.received,
             "latency_kind": "latest_send_age_ms",
             "latest_send_age_ms": summarize_ms(self.latest_send_age_samples),
@@ -356,6 +366,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
             "frame_height": args.height,
             "requested_send_fps": args.fps,
             "jpeg_quality": args.quality,
+            "input_jpeg_bytes": len(jpeg),
         }
     )
     return summary
@@ -376,6 +387,12 @@ def print_text_summary(summary: dict):
         "received_during_send={frames_received_during_send} "
         "send_fps={send_fps:.2f} receive_fps={receive_fps:.2f} "
         "sent_minus_received={sent_minus_received_frames}".format(**summary)
+    )
+    print(
+        "bytes sent={bytes_sent} received={bytes_received} "
+        "input_jpeg={input_jpeg_bytes} "
+        "avg_sent_frame={avg_sent_frame_bytes:.0f} "
+        "avg_received_frame={avg_received_frame_bytes:.0f}".format(**summary)
     )
     print(
         "latest_send_age_ms count={count} mean={mean_ms:.2f} "

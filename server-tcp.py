@@ -51,9 +51,10 @@ from aiohttp import web, WSMsgType
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fluxrt-tcp-server")
 
-JPEG_QUALITY = 70  # cv2 expects 0-100, matches the 0.7 quality factor
-                   # the original Daydream TD extension used for its own
-                   # local MJPEG-over-WebSocket relay (JPEG_QUALITY_STREAM)
+DEFAULT_OUTPUT_JPEG_QUALITY = 70  # cv2 expects 0-100; matches the 0.7
+                                  # quality factor the original Daydream TD
+                                  # extension used for its local MJPEG relay.
+JPEG_QUALITY = DEFAULT_OUTPUT_JPEG_QUALITY  # legacy module-level name
 OUTPUT_FPS = 25    # match FluxRT demo display pacing and the TD relay SEND_FPS
 
 WORK_PRESETS = {
@@ -97,6 +98,25 @@ class WorkConfig:
         return 1.0 / self.input_fps
 
 
+@dataclass(frozen=True)
+class JpegConfig:
+    output_quality: int
+
+    @property
+    def output_encode_params(self) -> list[int]:
+        return [cv2.IMWRITE_JPEG_QUALITY, self.output_quality]
+
+
+def jpeg_quality(value: str | int, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not 1 <= parsed <= 100:
+        raise ValueError(f"{name} must be between 1 and 100")
+    return parsed
+
+
 def positive_float(value: str, name: str) -> float:
     try:
         parsed = float(value)
@@ -119,6 +139,25 @@ def non_negative_float(value: str, name: str) -> float:
     if parsed < 0:
         raise ValueError(f"{name} must be non-negative")
     return parsed
+
+
+def build_jpeg_config(
+    *,
+    output_quality: int | None = None,
+    environ: dict[str, str] | None = None,
+) -> JpegConfig:
+    env = os.environ if environ is None else environ
+    resolved_output_quality = DEFAULT_OUTPUT_JPEG_QUALITY
+
+    if env.get("FLUXRT_OUTPUT_JPEG_QUALITY"):
+        resolved_output_quality = jpeg_quality(
+            env["FLUXRT_OUTPUT_JPEG_QUALITY"], "FLUXRT_OUTPUT_JPEG_QUALITY"
+        )
+
+    if output_quality is not None:
+        resolved_output_quality = jpeg_quality(output_quality, "--output-jpeg-quality")
+
+    return JpegConfig(output_quality=resolved_output_quality)
 
 
 def build_work_config(
@@ -201,8 +240,15 @@ class FluxRTRunner:
     latency difference we measure is attributable to transport, not to
     a different FluxRT integration."""
 
-    def __init__(self, config_path: str, use_int8: bool = False):
+    def __init__(
+        self,
+        config_path: str,
+        use_int8: bool = False,
+        jpeg_config: JpegConfig | None = None,
+    ):
         self._lock = threading.Lock()
+        self.jpeg_config = jpeg_config or build_jpeg_config()
+        self._output_jpeg_encode_params = self.jpeg_config.output_encode_params
         from fluxrt import StreamProcessor
         self.processor = StreamProcessor(config_path)
         if use_int8:
@@ -275,7 +321,7 @@ class FluxRTRunner:
 
         t0 = time.perf_counter()
         ok, encoded = cv2.imencode(
-            ".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+            ".jpg", processed, self._output_jpeg_encode_params
         )
         timings["output_encode"] = time.perf_counter() - t0
         if not ok:
@@ -288,6 +334,7 @@ async def handle_ws(request: web.Request):
     runner: FluxRTRunner = app["runner"]
     executor: ThreadPoolExecutor = app["executor"]
     work_config: WorkConfig = app["work_config"]
+    jpeg_config: JpegConfig = app["jpeg_config"]
 
     ws = web.WebSocketResponse(max_msg_size=20 * 1024 * 1024)  # 20MB, generous
                                                                 # headroom over
@@ -295,10 +342,11 @@ async def handle_ws(request: web.Request):
                                                                 # JPEG frame
     await ws.prepare(request)
     log.info(
-        "WebSocket client connected preset=%s output_fps=%.2f input_fps=%s",
+        "WebSocket client connected preset=%s output_fps=%.2f input_fps=%s output_jpeg_quality=%d",
         work_config.preset,
         work_config.output_fps,
         "uncapped" if work_config.input_fps <= 0 else f"{work_config.input_fps:.2f}",
+        jpeg_config.output_quality,
     )
 
     loop = asyncio.get_event_loop()
@@ -319,12 +367,15 @@ async def handle_ws(request: web.Request):
     timing_window = StageTimingWindow()
     stats = {
         "rx": 0,
+        "rx_bytes": 0,
         "input_overwritten": 0,
         "input_written": 0,
         "decode_failed": 0,
         "output_encoded": 0,
+        "output_encoded_bytes": 0,
         "output_overwritten": 0,
         "sent": 0,
+        "sent_bytes": 0,
     }
 
     def stop_all():
@@ -340,6 +391,7 @@ async def handle_ws(request: web.Request):
                         stats["input_overwritten"] += 1
                     latest_input["buf"] = msg.data
                     stats["rx"] += 1
+                    stats["rx_bytes"] += len(msg.data)
                     got_input.set()
 
                 elif msg.type == WSMsgType.TEXT:
@@ -419,6 +471,7 @@ async def handle_ws(request: web.Request):
                         stats["output_overwritten"] += 1
                     latest_output["buf"] = out
                     stats["output_encoded"] += 1
+                    stats["output_encoded_bytes"] += len(out)
                     got_output.set()
                 elapsed = time.perf_counter() - t0
                 delay = max(0.0, output_interval - elapsed)
@@ -450,6 +503,7 @@ async def handle_ws(request: web.Request):
                         "send", time.perf_counter() - send_t0
                     )
                 stats["sent"] += 1
+                stats["sent_bytes"] += len(out)
         except (ConnectionResetError, RuntimeError):
             pass
         except Exception:
@@ -472,12 +526,20 @@ async def handle_ws(request: web.Request):
                 delta = {k: stats[k] - last[k] for k in stats}
                 last = stats.copy()
                 timings = timing_window.snapshot()
+                avg_rx_kb = delta["rx_bytes"] / max(1, delta["rx"]) / 1024.0
+                avg_encoded_kb = (
+                    delta["output_encoded_bytes"]
+                    / max(1, delta["output_encoded"])
+                    / 1024.0
+                )
+                avg_sent_kb = delta["sent_bytes"] / max(1, delta["sent"]) / 1024.0
                 log.info(
                     "ws stats/5s window=%.2fs "
                     "rx=%d rx_fps=%.2f "
                     "wrote=%d wrote_fps=%.2f "
                     "encoded=%d encoded_fps=%.2f "
                     "sent=%d sent_fps=%.2f "
+                    "avg_kb rx=%.1f encoded=%.1f sent=%.1f "
                     "drop_in=%d drop_out=%d bad_decode=%d "
                     "hot_ms input_decode=%.2f/%.2f/%d "
                     "input_crop_copy=%.2f/%.2f/%d "
@@ -493,6 +555,9 @@ async def handle_ws(request: web.Request):
                     rate_per_second(delta["output_encoded"], elapsed),
                     delta["sent"],
                     rate_per_second(delta["sent"], elapsed),
+                    avg_rx_kb,
+                    avg_encoded_kb,
+                    avg_sent_kb,
                     delta["input_overwritten"],
                     delta["output_overwritten"],
                     delta["decode_failed"],
@@ -515,11 +580,15 @@ async def handle_ws(request: web.Request):
         finally:
             log.info(
                 "ws totals rx=%d wrote=%d encoded=%d sent=%d "
+                "rx_mb=%.2f encoded_mb=%.2f sent_mb=%.2f "
                 "drop_in=%d drop_out=%d bad_decode=%d",
                 stats["rx"],
                 stats["input_written"],
                 stats["output_encoded"],
                 stats["sent"],
+                stats["rx_bytes"] / 1024.0 / 1024.0,
+                stats["output_encoded_bytes"] / 1024.0 / 1024.0,
+                stats["sent_bytes"] / 1024.0 / 1024.0,
                 stats["input_overwritten"],
                 stats["output_overwritten"],
                 stats["decode_failed"],
@@ -564,6 +633,9 @@ async def handle_status(request: web.Request):
                 "output_fps": app["work_config"].output_fps,
                 "input_fps": app["work_config"].input_fps,
             },
+            "jpeg": {
+                "output_quality": app["jpeg_config"].output_quality,
+            },
         }
     )
 
@@ -587,11 +659,17 @@ async def handle_prompt(request: web.Request):
 
 
 def create_app(
-    config_path: str, use_int8: bool, work_config: WorkConfig | None = None
+    config_path: str,
+    use_int8: bool,
+    work_config: WorkConfig | None = None,
+    jpeg_config: JpegConfig | None = None,
 ) -> web.Application:
     app = web.Application()
     app["work_config"] = work_config or build_work_config()
-    app["runner"] = FluxRTRunner(config_path, use_int8=use_int8)
+    app["jpeg_config"] = jpeg_config or build_jpeg_config()
+    app["runner"] = FluxRTRunner(
+        config_path, use_int8=use_int8, jpeg_config=app["jpeg_config"]
+    )
     app.cleanup_ctx.append(executor_context)
     app.router.add_get("/ws", handle_ws)
     app.router.add_get("/status", handle_status)
@@ -634,6 +712,16 @@ def main():
             "Overrides preset and FLUXRT_INPUT_FPS."
         ),
     )
+    parser.add_argument(
+        "--output-jpeg-quality",
+        type=int,
+        default=None,
+        help=(
+            "Server output JPEG quality, 1-100. Default 70; lower values reduce "
+            "CPU encode cost and websocket bytes at visual quality cost. Can also "
+            "be set with FLUXRT_OUTPUT_JPEG_QUALITY."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -642,16 +730,20 @@ def main():
             output_fps=args.output_fps,
             input_fps=args.input_fps,
         )
+        jpeg_config = build_jpeg_config(output_quality=args.output_jpeg_quality)
     except ValueError as exc:
         parser.error(str(exc))
     log.info(
-        "work config preset=%s output_fps=%.2f input_fps=%s",
+        "work config preset=%s output_fps=%.2f input_fps=%s output_jpeg_quality=%d",
         work_config.preset,
         work_config.output_fps,
         "uncapped" if work_config.input_fps <= 0 else f"{work_config.input_fps:.2f}",
+        jpeg_config.output_quality,
     )
 
-    app = create_app(args.config, args.int8, work_config=work_config)
+    app = create_app(
+        args.config, args.int8, work_config=work_config, jpeg_config=jpeg_config
+    )
     web.run_app(app, host=args.host, port=args.port)
 
 
