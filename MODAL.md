@@ -91,13 +91,15 @@ python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
   --width 512 --height 512 --fps 25 --duration 30
 ```
 
-The script reports client-observed send/receive FPS and
-`latest_send_age_ms` mean/p50/p95/max. Since the server protocol does not tag
-frames and FluxRT input/output loops are decoupled, this is not a strict
-per-input model RTT; compare it with the backend's 5-second `ws stats/5s`
-`hot_ms` summaries to separate websocket pressure from server decode/crop/read/
-encode/send costs. Run the same command against the optional tunnel URL to
-compare `modal.run` and `modal.host` before opening TouchDesigner.
+The script reports client-observed send/receive FPS over the active send
+window, plus `latest_send_age_ms` mean/p50/p95/max. Connection setup and
+post-send receive drain are shown in elapsed time but do not dilute the headline
+FPS. Since the server protocol does not tag frames and FluxRT input/output loops
+are decoupled, this is not a strict per-input model RTT; compare it with the
+backend's 5-second `ws stats/5s` `hot_ms` summaries to separate websocket
+pressure from server decode/crop/read/encode/send costs. Run the same command
+against the optional tunnel URL to compare `modal.run` and `modal.host` before
+opening TouchDesigner.
 
 Modal only allows `routing_region` to be set when a Function is first created.
 If you already deployed this app before the `eu-west` routing change and Modal
@@ -139,8 +141,9 @@ Copy the printed `wss://.../ws` URL into TouchDesigner. The `/status` and
 extension derives that automatically from the WebSocket URL. This tunnel is
 temporary: it exists only while `modal run modal_app.py::serve_tunnel` is
 running, and the generated URL changes each time. Use `modal deploy` for a
-stable show URL; use the tunnel when its measured round trip beats the normal
-Modal endpoint enough to justify the temporary URL.
+stable show URL; use the tunnel when its measured websocket cadence and
+latest-send-age timing beat the normal Modal endpoint enough to justify the
+temporary URL.
 
 ## Pre-warming for a live show
 
@@ -162,10 +165,10 @@ drop the warm container.
 - **Latency.** For Berlin/Europe clients, the default Modal path now uses
   `routing_region="eu-west"` and `region="eu-west"` to avoid the previous
   default `us-east` routing path. This whole stack was built to *measure*
-  round-trip frame latency — compare the deployed `modal.run` URL with the
-  optional `modal.host` tunnel before committing to it for a show. A pre-warmed
-  `min_containers=1` container removes cold-start variance but does not change
-  network round-trip time.
+  websocket cadence, latest-send-age timing, and server hot-path costs —
+  compare the deployed `modal.run` URL with the optional `modal.host` tunnel
+  before committing to it for a show. A pre-warmed `min_containers=1` container
+  removes cold-start variance but does not change network transit time.
 - **Runtime stats.** The backend logs one `ws stats/5s` line per connected
   client. Use `rx_fps` vs. `wrote_fps` to compare receive pressure with
   accepted FluxRT input cadence, and `encoded_fps` vs. `sent_fps` plus

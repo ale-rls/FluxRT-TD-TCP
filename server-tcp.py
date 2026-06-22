@@ -6,17 +6,21 @@ RunPod Pods don't support: https://docs.runpod.io/pods/networking — Pods
 are TCP-only). This version carries frames over a plain WebSocket
 instead, which is just TCP, so it works unmodified on a RunPod Pod.
 
-Built to test ONE thing first: real round-trip frame latency over this
-TCP path, with FluxRT in the loop, before deciding whether the full
-two-tier WHIP/WHEP-over-udp-over-tcp architecture is worth building.
+Built to test ONE thing first: live frame cadence and server-observable
+latency over this TCP path, with FluxRT in the loop, before deciding
+whether the full two-tier WHIP/WHEP-over-udp-over-tcp architecture is
+worth building.
 
 Protocol (deliberately minimal):
   - client connects to ws://<host>:<port>/ws
   - client sends binary WebSocket messages, each one a single JPEG-
     encoded frame
-  - server runs each frame through FluxRT, returns the result as a
-    binary WebSocket message (also JPEG)
-  - client measures the round-trip time itself
+  - server writes input frames into FluxRT's input tensor and
+    independently reads the latest output tensor as a binary WebSocket
+    message (also JPEG)
+  - client measures send/receive cadence and latest-send-age timing;
+    exact per-input RTT is not available because frames are untagged and
+    FluxRT input/output loops are decoupled
 
 No WHIP/WHEP, no aiortc, no SDP — none of that machinery is needed or
 used here. This is intentionally the simplest thing that could possibly

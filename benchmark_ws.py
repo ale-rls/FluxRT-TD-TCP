@@ -54,12 +54,29 @@ def summarize_ms(samples_seconds: list[float]) -> dict[str, float | int]:
 class BenchmarkRecorder:
     sent: int = 0
     received: int = 0
+    received_during_send: int = 0
     bytes_sent: int = 0
     bytes_received: int = 0
     first_event_at: float | None = None
     last_event_at: float | None = None
     latest_send_at: float | None = None
     latest_send_age_samples: list[float] = field(default_factory=list)
+    send_started_at: float | None = None
+    send_ended_at: float | None = None
+    receive_started_at: float | None = None
+    receive_ended_at: float | None = None
+
+    def start_send_window(self, now: float):
+        self.send_started_at = now
+
+    def end_send_window(self, now: float):
+        self.send_ended_at = now
+
+    def start_receive_window(self, now: float):
+        self.receive_started_at = now
+
+    def end_receive_window(self, now: float):
+        self.receive_ended_at = now
 
     def mark_sent(self, now: float, size: int):
         self._mark_event(now)
@@ -70,6 +87,8 @@ class BenchmarkRecorder:
     def mark_received(self, now: float, size: int):
         self._mark_event(now)
         self.received += 1
+        if self.send_ended_at is None:
+            self.received_during_send += 1
         self.bytes_received += size
         if self.latest_send_at is not None:
             self.latest_send_age_samples.append(now - self.latest_send_at)
@@ -79,17 +98,34 @@ class BenchmarkRecorder:
             self.first_event_at = now
         self.last_event_at = now
 
+    def send_window_seconds(self) -> float:
+        if self.send_started_at is None or self.send_ended_at is None:
+            return 0.0
+        return max(0.0, self.send_ended_at - self.send_started_at)
+
+    def receive_window_seconds(self) -> float:
+        if self.receive_started_at is None or self.receive_ended_at is None:
+            return 0.0
+        return max(0.0, self.receive_ended_at - self.receive_started_at)
+
     def summary(self, requested_duration: float, elapsed: float) -> dict:
+        send_window_s = self.send_window_seconds()
+        receive_window_s = self.receive_window_seconds()
         return {
             "requested_duration_s": requested_duration,
             "elapsed_s": elapsed,
+            "send_window_s": send_window_s,
+            "receive_window_s": receive_window_s,
             "frames_sent": self.sent,
             "frames_received": self.received,
-            "send_fps": rate_per_second(self.sent, elapsed),
-            "receive_fps": rate_per_second(self.received, elapsed),
+            "frames_received_during_send": self.received_during_send,
+            "send_fps": rate_per_second(self.sent, send_window_s),
+            "receive_fps": rate_per_second(
+                self.received_during_send, receive_window_s
+            ),
             "bytes_sent": self.bytes_sent,
             "bytes_received": self.bytes_received,
-            "unmatched_sent_frames": max(0, self.sent - self.received),
+            "sent_minus_received_frames": self.sent - self.received,
             "latency_kind": "latest_send_age_ms",
             "latest_send_age_ms": summarize_ms(self.latest_send_age_samples),
             "protocol_note": (
@@ -204,7 +240,6 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
 
     jpeg = make_synthetic_jpeg(args.width, args.height, args.quality)
     recorder = BenchmarkRecorder()
-    started_at = time.perf_counter()
     send_done = asyncio.Event()
 
     timeout = aiohttp.ClientTimeout(total=args.duration + args.receive_drain + 30.0)
@@ -212,11 +247,15 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
         async with session.ws_connect(
             args.url, max_msg_size=args.max_message_mb * 1024 * 1024
         ) as ws:
+            benchmark_started_at = time.perf_counter()
+            recorder.start_receive_window(benchmark_started_at)
 
             async def send_loop():
                 interval = 1.0 / args.fps
-                next_send = time.perf_counter()
-                stop_at = started_at + args.duration
+                send_started_at = benchmark_started_at
+                recorder.start_send_window(send_started_at)
+                next_send = send_started_at
+                stop_at = send_started_at + args.duration
                 try:
                     while True:
                         now = time.perf_counter()
@@ -231,10 +270,12 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
                         recorder.mark_sent(time.perf_counter(), len(jpeg))
                         next_send = max(next_send + interval, time.perf_counter())
                 finally:
+                    recorder.end_send_window(time.perf_counter())
+                    recorder.end_receive_window(recorder.send_ended_at)
                     send_done.set()
 
             async def receive_loop():
-                stop_at = started_at + args.duration + args.receive_drain
+                stop_at = benchmark_started_at + args.duration + args.receive_drain
                 while True:
                     remaining = stop_at - time.perf_counter()
                     if remaining <= 0:
@@ -258,17 +299,19 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
 
             await asyncio.gather(send_loop(), receive_loop())
 
-    elapsed = time.perf_counter() - started_at
+    elapsed = time.perf_counter() - benchmark_started_at
     return recorder.summary(args.duration, elapsed)
 
 
 def print_text_summary(summary: dict):
     latency = summary["latest_send_age_ms"]
     print(
-        "duration={elapsed_s:.2f}s requested={requested_duration_s:.2f}s "
+        "elapsed={elapsed_s:.2f}s requested={requested_duration_s:.2f}s "
+        "send_window={send_window_s:.2f}s receive_window={receive_window_s:.2f}s "
         "sent={frames_sent} received={frames_received} "
+        "received_during_send={frames_received_during_send} "
         "send_fps={send_fps:.2f} receive_fps={receive_fps:.2f} "
-        "unmatched_sent={unmatched_sent_frames}".format(**summary)
+        "sent_minus_received={sent_minus_received_frames}".format(**summary)
     )
     print(
         "latest_send_age_ms count={count} mean={mean_ms:.2f} "

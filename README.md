@@ -203,12 +203,15 @@ or the optional tunnel. The benchmark script itself does not need FluxRT weights
 locally; weights are only needed by the server it connects to. It uses `aiohttp`
 for websocket transport and OpenCV+NumPy, or Pillow, to generate JPEG frames.
 
-Client output reports duration, frames sent/received, send/receive FPS,
-unmatched sent frames, and `latest_send_age_ms` mean/p50/p95/max. Because the
-server protocol intentionally does not tag frames and FluxRT input/output loops
-are decoupled, that latency is the age since the latest client send when a
-binary response arrived, not a strict per-input model round trip. Pair it with
-the server's `ws stats/5s` `hot_ms` fields to separate network pressure,
-server CPU/shared-memory costs, and FluxRT output cadence across runs.
+Client output reports elapsed time, active send/receive windows, frames
+sent/received, send/receive FPS for the active send window, the simple
+`sent_minus_received` count delta, and `latest_send_age_ms` mean/p50/p95/max.
+Connection setup and post-send receive drain do not dilute the headline FPS
+numbers. Because the server protocol intentionally does not tag frames and
+FluxRT input/output loops are decoupled, that latency is the age since the
+latest client send when a binary response arrived, not a strict per-input model
+round trip. Pair it with the server's `ws stats/5s` `hot_ms` fields to separate
+network pressure, server CPU/shared-memory costs, and FluxRT output cadence
+across runs.
 
 ---

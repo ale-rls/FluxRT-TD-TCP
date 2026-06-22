@@ -13,21 +13,63 @@ class BenchmarkWsHelpersTest(unittest.TestCase):
         self.assertEqual(summary["p95_ms"], 100.0)
         self.assertEqual(summary["max_ms"], 100.0)
 
-    def test_recorder_summary_reports_cadence_and_unmatched_sends(self):
+    def test_recorder_summary_reports_cadence_and_count_delta(self):
         recorder = benchmark_ws.BenchmarkRecorder()
+        recorder.start_send_window(10.0)
+        recorder.start_receive_window(10.0)
         recorder.mark_sent(10.0, 100)
         recorder.mark_sent(10.5, 100)
         recorder.mark_received(10.75, 200)
+        recorder.end_send_window(11.0)
+        recorder.end_receive_window(11.0)
 
-        summary = recorder.summary(requested_duration=1.0, elapsed=1.0)
+        summary = recorder.summary(requested_duration=1.0, elapsed=3.0)
 
         self.assertEqual(summary["frames_sent"], 2)
         self.assertEqual(summary["frames_received"], 1)
+        self.assertEqual(summary["frames_received_during_send"], 1)
+        self.assertEqual(summary["send_window_s"], 1.0)
+        self.assertEqual(summary["receive_window_s"], 1.0)
         self.assertEqual(summary["send_fps"], 2.0)
         self.assertEqual(summary["receive_fps"], 1.0)
-        self.assertEqual(summary["unmatched_sent_frames"], 1)
+        self.assertEqual(summary["sent_minus_received_frames"], 1)
         self.assertEqual(summary["latest_send_age_ms"]["count"], 1)
         self.assertEqual(summary["latest_send_age_ms"]["mean_ms"], 250.0)
+
+    def test_recorder_fps_ignores_connection_delay_and_drain(self):
+        recorder = benchmark_ws.BenchmarkRecorder()
+        recorder.start_send_window(5.0)
+        recorder.start_receive_window(5.0)
+        for offset in (0.0, 0.25, 0.50, 0.75):
+            recorder.mark_sent(5.0 + offset, 100)
+            recorder.mark_received(5.0 + offset + 0.10, 200)
+        recorder.end_send_window(6.0)
+        recorder.end_receive_window(6.0)
+
+        summary = recorder.summary(requested_duration=1.0, elapsed=8.0)
+
+        self.assertEqual(summary["elapsed_s"], 8.0)
+        self.assertEqual(summary["send_window_s"], 1.0)
+        self.assertEqual(summary["receive_window_s"], 1.0)
+        self.assertEqual(summary["send_fps"], 4.0)
+        self.assertEqual(summary["receive_fps"], 4.0)
+
+    def test_recorder_receive_fps_excludes_drain_responses(self):
+        recorder = benchmark_ws.BenchmarkRecorder()
+        recorder.start_send_window(20.0)
+        recorder.start_receive_window(20.0)
+        recorder.mark_sent(20.0, 100)
+        recorder.mark_received(20.5, 200)
+        recorder.end_send_window(21.0)
+        recorder.end_receive_window(21.0)
+        recorder.mark_received(22.0, 200)
+
+        summary = recorder.summary(requested_duration=1.0, elapsed=3.0)
+
+        self.assertEqual(summary["frames_received"], 2)
+        self.assertEqual(summary["frames_received_during_send"], 1)
+        self.assertEqual(summary["receive_fps"], 1.0)
+        self.assertEqual(summary["sent_minus_received_frames"], -1)
 
     def test_parse_args_validates_benchmark_inputs(self):
         args = benchmark_ws.parse_args(
