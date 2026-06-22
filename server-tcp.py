@@ -41,6 +41,7 @@ import math
 import os
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -329,70 +330,86 @@ class FluxRTRunner:
         return encoded.tobytes(), timings
 
 
-async def handle_ws(request: web.Request):
-    app = request.app
-    runner: FluxRTRunner = app["runner"]
-    executor: ThreadPoolExecutor = app["executor"]
-    work_config: WorkConfig = app["work_config"]
-    jpeg_config: JpegConfig = app["jpeg_config"]
+class FluxRTWebSocketSession:
+    """Owns per-client WebSocket state and worker task lifecycle."""
 
-    ws = web.WebSocketResponse(max_msg_size=20 * 1024 * 1024)  # 20MB, generous
-                                                                # headroom over
-                                                                # any single
-                                                                # JPEG frame
-    await ws.prepare(request)
-    log.info(
-        "WebSocket client connected preset=%s output_fps=%.2f input_fps=%s output_jpeg_quality=%d",
-        work_config.preset,
-        work_config.output_fps,
-        "uncapped" if work_config.input_fps <= 0 else f"{work_config.input_fps:.2f}",
-        jpeg_config.output_quality,
-    )
+    def __init__(self, request: web.Request, server: "FluxRTServer"):
+        self.request = request
+        self.server = server
+        self.runner = server.runner
+        self.executor = server.require_executor()
+        self.work_config = server.work_config
+        self.jpeg_config = server.jpeg_config
+        self.loop = asyncio.get_event_loop()
 
-    loop = asyncio.get_event_loop()
+        self.ws = web.WebSocketResponse(max_msg_size=20 * 1024 * 1024)
+        self.latest_input: bytes | None = None
+        self.latest_output: bytes | None = None
+        self.got_input = asyncio.Event()
+        self.got_output = asyncio.Event()
+        self.stop_event = asyncio.Event()
+        self.send_lock = asyncio.Lock()
+        self.timing_window = StageTimingWindow()
+        self.stats = {
+            "rx": 0,
+            "rx_bytes": 0,
+            "input_overwritten": 0,
+            "input_written": 0,
+            "decode_failed": 0,
+            "output_encoded": 0,
+            "output_encoded_bytes": 0,
+            "output_overwritten": 0,
+            "sent": 0,
+            "sent_bytes": 0,
+        }
 
-    # Output read rate. The model produces ~8fps natively but RIFE fills
-    # in between, so the output tensor refreshes faster than that. A
-    # separate sender task drains a latest-only slot, so slow network sends
-    # drop stale encoded outputs instead of making a send queue.
-    output_interval = work_config.output_interval
-    input_interval = work_config.input_interval
+    async def run(self):
+        await self.ws.prepare(self.request)
+        log.info(
+            "WebSocket client connected preset=%s output_fps=%.2f "
+            "input_fps=%s output_jpeg_quality=%d",
+            self.work_config.preset,
+            self.work_config.output_fps,
+            (
+                "uncapped"
+                if self.work_config.input_fps <= 0
+                else f"{self.work_config.input_fps:.2f}"
+            ),
+            self.jpeg_config.output_quality,
+        )
 
-    latest_input = {"buf": None}
-    got_input = asyncio.Event()
-    latest_output = {"buf": None}
-    got_output = asyncio.Event()
-    stop_event = asyncio.Event()
-    send_lock = asyncio.Lock()
-    timing_window = StageTimingWindow()
-    stats = {
-        "rx": 0,
-        "rx_bytes": 0,
-        "input_overwritten": 0,
-        "input_written": 0,
-        "decode_failed": 0,
-        "output_encoded": 0,
-        "output_encoded_bytes": 0,
-        "output_overwritten": 0,
-        "sent": 0,
-        "sent_bytes": 0,
-    }
-
-    def stop_all():
-        stop_event.set()
-        got_input.set()
-        got_output.set()
-
-    async def receiver():
+        tasks = [
+            asyncio.create_task(self.receiver()),
+            asyncio.create_task(self.input_worker()),
+            asyncio.create_task(self.output_worker()),
+            asyncio.create_task(self.sender()),
+            asyncio.create_task(self.stats_loop()),
+        ]
         try:
-            async for msg in ws:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            self.stop_all()
+            await self.ws.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        log.info("WebSocket client disconnected")
+        return self.ws
+
+    def stop_all(self):
+        self.stop_event.set()
+        self.got_input.set()
+        self.got_output.set()
+
+    async def receiver(self):
+        try:
+            async for msg in self.ws:
                 if msg.type == WSMsgType.BINARY:
-                    if latest_input["buf"] is not None:
-                        stats["input_overwritten"] += 1
-                    latest_input["buf"] = msg.data
-                    stats["rx"] += 1
-                    stats["rx_bytes"] += len(msg.data)
-                    got_input.set()
+                    if self.latest_input is not None:
+                        self.stats["input_overwritten"] += 1
+                    self.latest_input = msg.data
+                    self.stats["rx"] += 1
+                    self.stats["rx_bytes"] += len(msg.data)
+                    self.got_input.set()
 
                 elif msg.type == WSMsgType.TEXT:
                     try:
@@ -402,31 +419,32 @@ async def handle_ws(request: web.Request):
                         continue
 
                     if "prompt" in data:
-                        await loop.run_in_executor(
-                            executor, runner.set_prompt, data["prompt"]
+                        await self.loop.run_in_executor(
+                            self.executor, self.runner.set_prompt, data["prompt"]
                         )
-                        async with send_lock:
-                            await ws.send_str(json.dumps({"ok": True}))
+                        async with self.send_lock:
+                            await self.ws.send_str(json.dumps({"ok": True}))
 
                 elif msg.type == WSMsgType.ERROR:
-                    log.error(f"WebSocket closed with exception {ws.exception()}")
+                    log.error(f"WebSocket closed with exception {self.ws.exception()}")
                     break
         except (ConnectionResetError, RuntimeError):
             pass
         except Exception:
             log.exception("receiver error")
         finally:
-            stop_all()
+            self.stop_all()
 
-    async def input_worker():
+    async def input_worker(self):
         # Consumes only the newest input JPEG and writes FluxRT's input tensor
         # from the worker pool, keeping decode/crop/copy off the event loop.
         last_input_started_at: float | None = None
+        input_interval = self.work_config.input_interval
         try:
-            while not stop_event.is_set():
-                await got_input.wait()
-                got_input.clear()
-                if stop_event.is_set():
+            while not self.stop_event.is_set():
+                await self.got_input.wait()
+                self.got_input.clear()
+                if self.stop_event.is_set():
                     break
                 if input_interval and last_input_started_at is not None:
                     delay = max(
@@ -435,227 +453,266 @@ async def handle_ws(request: web.Request):
                     )
                     if delay:
                         with contextlib.suppress(asyncio.TimeoutError):
-                            await asyncio.wait_for(stop_event.wait(), timeout=delay)
-                    if stop_event.is_set():
+                            await asyncio.wait_for(
+                                self.stop_event.wait(), timeout=delay
+                            )
+                    if self.stop_event.is_set():
                         break
-                buf = latest_input["buf"]
-                latest_input["buf"] = None
+                buf = self.latest_input
+                self.latest_input = None
                 if buf is None:
                     continue
                 last_input_started_at = time.perf_counter()
-                ok, timings = await loop.run_in_executor(
-                    executor, runner.write_input_jpeg_timed, buf
+                ok, timings = await self.loop.run_in_executor(
+                    self.executor, self.runner.write_input_jpeg_timed, buf
                 )
-                timing_window.observe_many(timings)
+                self.timing_window.observe_many(timings)
                 if ok:
-                    stats["input_written"] += 1
+                    self.stats["input_written"] += 1
                 else:
-                    stats["decode_failed"] += 1
+                    self.stats["decode_failed"] += 1
         except Exception:
             log.exception("input_worker error")
         finally:
-            stop_all()
+            self.stop_all()
 
-    async def output_worker():
+    async def output_worker(self):
         # Independent of input: on a steady timer, read whatever's currently
         # in the output tensor and encode it into a latest-only output slot.
+        output_interval = self.work_config.output_interval
         try:
-            while not stop_event.is_set():
+            while not self.stop_event.is_set():
                 t0 = time.perf_counter()
-                out, timings = await loop.run_in_executor(
-                    executor, runner.read_output_jpeg_timed
+                out, timings = await self.loop.run_in_executor(
+                    self.executor, self.runner.read_output_jpeg_timed
                 )
-                timing_window.observe_many(timings)
+                self.timing_window.observe_many(timings)
                 if out is not None:
-                    if latest_output["buf"] is not None:
-                        stats["output_overwritten"] += 1
-                    latest_output["buf"] = out
-                    stats["output_encoded"] += 1
-                    stats["output_encoded_bytes"] += len(out)
-                    got_output.set()
+                    if self.latest_output is not None:
+                        self.stats["output_overwritten"] += 1
+                    self.latest_output = out
+                    self.stats["output_encoded"] += 1
+                    self.stats["output_encoded_bytes"] += len(out)
+                    self.got_output.set()
                 elapsed = time.perf_counter() - t0
                 delay = max(0.0, output_interval - elapsed)
                 if delay:
                     with contextlib.suppress(asyncio.TimeoutError):
-                        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                        await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
         except Exception:
             log.exception("output_worker error")
         finally:
-            stop_all()
+            self.stop_all()
 
-    async def sender():
+    async def sender(self):
         # Sends only the freshest encoded output available after each network
         # backpressure wait. Older outputs are overwritten by output_worker.
         try:
-            while not stop_event.is_set():
-                await got_output.wait()
-                got_output.clear()
-                if stop_event.is_set():
+            while not self.stop_event.is_set():
+                await self.got_output.wait()
+                self.got_output.clear()
+                if self.stop_event.is_set():
                     break
-                out = latest_output["buf"]
-                latest_output["buf"] = None
+                out = self.latest_output
+                self.latest_output = None
                 if out is None:
                     continue
-                async with send_lock:
+                async with self.send_lock:
                     send_t0 = time.perf_counter()
-                    await ws.send_bytes(out)
-                    timing_window.observe_seconds(
+                    await self.ws.send_bytes(out)
+                    self.timing_window.observe_seconds(
                         "send", time.perf_counter() - send_t0
                     )
-                stats["sent"] += 1
-                stats["sent_bytes"] += len(out)
+                self.stats["sent"] += 1
+                self.stats["sent_bytes"] += len(out)
         except (ConnectionResetError, RuntimeError):
             pass
         except Exception:
             log.exception("sender error")
         finally:
-            stop_all()
+            self.stop_all()
 
-    async def stats_loop():
-        last = stats.copy()
+    async def stats_loop(self):
+        last = self.stats.copy()
         last_report_t = time.perf_counter()
         try:
-            while not stop_event.is_set():
+            while not self.stop_event.is_set():
                 with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(stop_event.wait(), timeout=5.0)
-                if stop_event.is_set():
+                    await asyncio.wait_for(self.stop_event.wait(), timeout=5.0)
+                if self.stop_event.is_set():
                     break
                 now = time.perf_counter()
                 elapsed = now - last_report_t
                 last_report_t = now
-                delta = {k: stats[k] - last[k] for k in stats}
-                last = stats.copy()
-                timings = timing_window.snapshot()
-                avg_rx_kb = delta["rx_bytes"] / max(1, delta["rx"]) / 1024.0
-                avg_encoded_kb = (
-                    delta["output_encoded_bytes"]
-                    / max(1, delta["output_encoded"])
-                    / 1024.0
-                )
-                avg_sent_kb = delta["sent_bytes"] / max(1, delta["sent"]) / 1024.0
-                log.info(
-                    "ws stats/5s window=%.2fs "
-                    "rx=%d rx_fps=%.2f "
-                    "wrote=%d wrote_fps=%.2f "
-                    "encoded=%d encoded_fps=%.2f "
-                    "sent=%d sent_fps=%.2f "
-                    "avg_kb rx=%.1f encoded=%.1f sent=%.1f "
-                    "drop_in=%d drop_out=%d bad_decode=%d "
-                    "hot_ms input_decode=%.2f/%.2f/%d "
-                    "input_crop_copy=%.2f/%.2f/%d "
-                    "output_read=%.2f/%.2f/%d "
-                    "output_encode=%.2f/%.2f/%d "
-                    "send=%.2f/%.2f/%d",
-                    elapsed,
-                    delta["rx"],
-                    rate_per_second(delta["rx"], elapsed),
-                    delta["input_written"],
-                    rate_per_second(delta["input_written"], elapsed),
-                    delta["output_encoded"],
-                    rate_per_second(delta["output_encoded"], elapsed),
-                    delta["sent"],
-                    rate_per_second(delta["sent"], elapsed),
-                    avg_rx_kb,
-                    avg_encoded_kb,
-                    avg_sent_kb,
-                    delta["input_overwritten"],
-                    delta["output_overwritten"],
-                    delta["decode_failed"],
-                    timings["input_decode"]["mean_ms"],
-                    timings["input_decode"]["p95_ms"],
-                    timings["input_decode"]["count"],
-                    timings["input_crop_copy"]["mean_ms"],
-                    timings["input_crop_copy"]["p95_ms"],
-                    timings["input_crop_copy"]["count"],
-                    timings["output_read"]["mean_ms"],
-                    timings["output_read"]["p95_ms"],
-                    timings["output_read"]["count"],
-                    timings["output_encode"]["mean_ms"],
-                    timings["output_encode"]["p95_ms"],
-                    timings["output_encode"]["count"],
-                    timings["send"]["mean_ms"],
-                    timings["send"]["p95_ms"],
-                    timings["send"]["count"],
-                )
+                delta = {k: self.stats[k] - last[k] for k in self.stats}
+                last = self.stats.copy()
+                self.log_stats_window(elapsed, delta)
         finally:
-            log.info(
-                "ws totals rx=%d wrote=%d encoded=%d sent=%d "
-                "rx_mb=%.2f encoded_mb=%.2f sent_mb=%.2f "
-                "drop_in=%d drop_out=%d bad_decode=%d",
-                stats["rx"],
-                stats["input_written"],
-                stats["output_encoded"],
-                stats["sent"],
-                stats["rx_bytes"] / 1024.0 / 1024.0,
-                stats["output_encoded_bytes"] / 1024.0 / 1024.0,
-                stats["sent_bytes"] / 1024.0 / 1024.0,
-                stats["input_overwritten"],
-                stats["output_overwritten"],
-                stats["decode_failed"],
+            self.log_totals()
+
+    def log_stats_window(self, elapsed: float, delta: dict[str, int]):
+        timings = self.timing_window.snapshot()
+        avg_rx_kb = delta["rx_bytes"] / max(1, delta["rx"]) / 1024.0
+        avg_encoded_kb = (
+            delta["output_encoded_bytes"] / max(1, delta["output_encoded"]) / 1024.0
+        )
+        avg_sent_kb = delta["sent_bytes"] / max(1, delta["sent"]) / 1024.0
+        log.info(
+            "ws stats/5s window=%.2fs "
+            "rx=%d rx_fps=%.2f "
+            "wrote=%d wrote_fps=%.2f "
+            "encoded=%d encoded_fps=%.2f "
+            "sent=%d sent_fps=%.2f "
+            "avg_kb rx=%.1f encoded=%.1f sent=%.1f "
+            "drop_in=%d drop_out=%d bad_decode=%d "
+            "hot_ms input_decode=%.2f/%.2f/%d "
+            "input_crop_copy=%.2f/%.2f/%d "
+            "output_read=%.2f/%.2f/%d "
+            "output_encode=%.2f/%.2f/%d "
+            "send=%.2f/%.2f/%d",
+            elapsed,
+            delta["rx"],
+            rate_per_second(delta["rx"], elapsed),
+            delta["input_written"],
+            rate_per_second(delta["input_written"], elapsed),
+            delta["output_encoded"],
+            rate_per_second(delta["output_encoded"], elapsed),
+            delta["sent"],
+            rate_per_second(delta["sent"], elapsed),
+            avg_rx_kb,
+            avg_encoded_kb,
+            avg_sent_kb,
+            delta["input_overwritten"],
+            delta["output_overwritten"],
+            delta["decode_failed"],
+            timings["input_decode"]["mean_ms"],
+            timings["input_decode"]["p95_ms"],
+            timings["input_decode"]["count"],
+            timings["input_crop_copy"]["mean_ms"],
+            timings["input_crop_copy"]["p95_ms"],
+            timings["input_crop_copy"]["count"],
+            timings["output_read"]["mean_ms"],
+            timings["output_read"]["p95_ms"],
+            timings["output_read"]["count"],
+            timings["output_encode"]["mean_ms"],
+            timings["output_encode"]["p95_ms"],
+            timings["output_encode"]["count"],
+            timings["send"]["mean_ms"],
+            timings["send"]["p95_ms"],
+            timings["send"]["count"],
+        )
+
+    def log_totals(self):
+        log.info(
+            "ws totals rx=%d wrote=%d encoded=%d sent=%d "
+            "rx_mb=%.2f encoded_mb=%.2f sent_mb=%.2f "
+            "drop_in=%d drop_out=%d bad_decode=%d",
+            self.stats["rx"],
+            self.stats["input_written"],
+            self.stats["output_encoded"],
+            self.stats["sent"],
+            self.stats["rx_bytes"] / 1024.0 / 1024.0,
+            self.stats["output_encoded_bytes"] / 1024.0 / 1024.0,
+            self.stats["sent_bytes"] / 1024.0 / 1024.0,
+            self.stats["input_overwritten"],
+            self.stats["output_overwritten"],
+            self.stats["decode_failed"],
+        )
+
+
+class FluxRTServer:
+    """Owns shared server state and aiohttp lifecycle hooks."""
+
+    def __init__(
+        self,
+        config_path: str,
+        use_int8: bool,
+        work_config: WorkConfig | None = None,
+        jpeg_config: JpegConfig | None = None,
+        runner_factory: Callable[..., FluxRTRunner] = FluxRTRunner,
+    ):
+        self.work_config = work_config or build_work_config()
+        self.jpeg_config = jpeg_config or build_jpeg_config()
+        self.runner = runner_factory(
+            config_path, use_int8=use_int8, jpeg_config=self.jpeg_config
+        )
+        self._executor: ThreadPoolExecutor | None = None
+
+    @property
+    def executor(self) -> ThreadPoolExecutor | None:
+        return self._executor
+
+    def start_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="fluxrt-ws"
             )
+        return self._executor
 
-    tasks = [
-        asyncio.create_task(receiver()),
-        asyncio.create_task(input_worker()),
-        asyncio.create_task(output_worker()),
-        asyncio.create_task(sender()),
-        asyncio.create_task(stats_loop()),
-    ]
-    try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        stop_all()
-        await ws.close()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    def shutdown_executor(self):
+        if self._executor is None:
+            return
+        executor = self._executor
+        self._executor = None
+        executor.shutdown(wait=True)
 
-    log.info("WebSocket client disconnected")
-    return ws
+    def require_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            raise RuntimeError("FluxRTServer executor is not running")
+        return self._executor
 
+    def create_app(self) -> web.Application:
+        app = web.Application()
+        app["server"] = self
+        app.cleanup_ctx.append(self.executor_context)
+        app.router.add_get("/ws", self.handle_ws)
+        app.router.add_get("/status", self.handle_status)
+        app.router.add_post("/prompt", self.handle_prompt)
+        return app
 
-async def executor_context(app: web.Application):
-    app["executor"] = ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="fluxrt-ws"
-    )
-    try:
-        yield
-    finally:
-        app["executor"].shutdown(wait=True)
+    async def executor_context(self, app: web.Application):
+        self.start_executor()
+        try:
+            yield
+        finally:
+            self.shutdown_executor()
 
+    async def handle_ws(self, request: web.Request):
+        return await FluxRTWebSocketSession(request, self).run()
 
-async def handle_status(request: web.Request):
-    app = request.app
-    return web.json_response(
-        {
-            "resolution": app["runner"].resolution,
-            "transport": "websocket-tcp",
-            "work": {
-                "preset": app["work_config"].preset,
-                "output_fps": app["work_config"].output_fps,
-                "input_fps": app["work_config"].input_fps,
-            },
-            "jpeg": {
-                "output_quality": app["jpeg_config"].output_quality,
-            },
-        }
-    )
+    async def handle_status(self, request: web.Request):
+        return web.json_response(
+            {
+                "resolution": self.runner.resolution,
+                "transport": "websocket-tcp",
+                "work": {
+                    "preset": self.work_config.preset,
+                    "output_fps": self.work_config.output_fps,
+                    "input_fps": self.work_config.input_fps,
+                },
+                "jpeg": {
+                    "output_quality": self.jpeg_config.output_quality,
+                },
+            }
+        )
 
-
-async def handle_prompt(request: web.Request):
-    """HTTP POST {"prompt": "..."} — used by the TD extension to update
-    the prompt out-of-band from the frame WebSocket. (Prompts can also
-    arrive as WebSocket text messages via handle_ws; both routes call
-    the same runner.set_prompt.)"""
-    app = request.app
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid json"}, status=400)
-    prompt = data.get("prompt")
-    if not prompt:
-        return web.json_response({"error": "missing 'prompt'"}, status=400)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(app["executor"], app["runner"].set_prompt, prompt)
-    return web.json_response({"ok": True, "prompt": prompt})
+    async def handle_prompt(self, request: web.Request):
+        """HTTP POST {"prompt": "..."} — used by the TD extension to update
+        the prompt out-of-band from the frame WebSocket. (Prompts can also
+        arrive as WebSocket text messages via handle_ws; both routes call
+        the same runner.set_prompt.)"""
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        prompt = data.get("prompt")
+        if not prompt:
+            return web.json_response({"error": "missing 'prompt'"}, status=400)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            self.require_executor(), self.runner.set_prompt, prompt
+        )
+        return web.json_response({"ok": True, "prompt": prompt})
 
 
 def create_app(
@@ -664,17 +721,9 @@ def create_app(
     work_config: WorkConfig | None = None,
     jpeg_config: JpegConfig | None = None,
 ) -> web.Application:
-    app = web.Application()
-    app["work_config"] = work_config or build_work_config()
-    app["jpeg_config"] = jpeg_config or build_jpeg_config()
-    app["runner"] = FluxRTRunner(
-        config_path, use_int8=use_int8, jpeg_config=app["jpeg_config"]
-    )
-    app.cleanup_ctx.append(executor_context)
-    app.router.add_get("/ws", handle_ws)
-    app.router.add_get("/status", handle_status)
-    app.router.add_post("/prompt", handle_prompt)
-    return app
+    return FluxRTServer(
+        config_path, use_int8=use_int8, work_config=work_config, jpeg_config=jpeg_config
+    ).create_app()
 
 
 def main():

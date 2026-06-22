@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -6,12 +7,28 @@ from pathlib import Path
 
 
 def load_server_module():
+    class FakeRouter:
+        def __init__(self):
+            self.routes = []
+
+        def add_get(self, path, handler):
+            self.routes.append(("GET", path, handler))
+
+        def add_post(self, path, handler):
+            self.routes.append(("POST", path, handler))
+
+    class FakeApplication(dict):
+        def __init__(self):
+            super().__init__()
+            self.cleanup_ctx = []
+            self.router = FakeRouter()
+
     aiohttp = types.ModuleType("aiohttp")
     aiohttp.web = types.SimpleNamespace(
         Request=object,
-        Application=object,
+        Application=FakeApplication,
         WebSocketResponse=object,
-        json_response=lambda *args, **kwargs: None,
+        json_response=lambda data, **kwargs: {"data": data, **kwargs},
     )
     aiohttp.WSMsgType = types.SimpleNamespace(BINARY=1, TEXT=2, ERROR=3)
 
@@ -32,6 +49,26 @@ def load_server_module():
 
 
 server_tcp = load_server_module()
+
+
+class FakeRunner:
+    def __init__(self, config_path, use_int8=False, jpeg_config=None):
+        self.config_path = config_path
+        self.use_int8 = use_int8
+        self.jpeg_config = jpeg_config
+        self.resolution = {"width": 512, "height": 512}
+        self.prompts = []
+
+    def set_prompt(self, prompt):
+        self.prompts.append(prompt)
+
+
+class FakeJsonRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
 
 
 class StageTimingWindowTest(unittest.TestCase):
@@ -156,6 +193,93 @@ class JpegConfigTest(unittest.TestCase):
             server_tcp.build_jpeg_config(
                 environ={"FLUXRT_OUTPUT_JPEG_QUALITY": "101"}
             )
+
+
+class FluxRTServerLifecycleTest(unittest.TestCase):
+    def make_server(self):
+        return server_tcp.FluxRTServer(
+            "config.json",
+            use_int8=True,
+            work_config=server_tcp.WorkConfig(
+                preset="light", output_fps=15.0, input_fps=15.0
+            ),
+            jpeg_config=server_tcp.JpegConfig(output_quality=55),
+            runner_factory=FakeRunner,
+        )
+
+    def test_server_owns_runner_and_config(self):
+        server = self.make_server()
+
+        self.assertIsInstance(server.runner, FakeRunner)
+        self.assertEqual(server.runner.config_path, "config.json")
+        self.assertTrue(server.runner.use_int8)
+        self.assertIs(server.runner.jpeg_config, server.jpeg_config)
+        self.assertEqual(server.work_config.preset, "light")
+        self.assertEqual(server.jpeg_config.output_quality, 55)
+
+    def test_executor_lifecycle_is_explicit_and_idempotent(self):
+        server = self.make_server()
+
+        with self.assertRaises(RuntimeError):
+            server.require_executor()
+
+        executor = server.start_executor()
+        self.assertIs(server.executor, executor)
+        self.assertIs(server.require_executor(), executor)
+        self.assertIs(server.start_executor(), executor)
+
+        server.shutdown_executor()
+        self.assertIsNone(server.executor)
+        with self.assertRaises(RuntimeError):
+            server.require_executor()
+
+        server.shutdown_executor()
+
+    def test_create_app_registers_server_lifecycle_and_public_routes(self):
+        server = self.make_server()
+
+        app = server.create_app()
+
+        self.assertIs(app["server"], server)
+        self.assertEqual(app.cleanup_ctx, [server.executor_context])
+        self.assertEqual(
+            [(method, path) for method, path, _handler in app.router.routes],
+            [("GET", "/ws"), ("GET", "/status"), ("POST", "/prompt")],
+        )
+
+    def test_status_response_preserves_public_fields(self):
+        server = self.make_server()
+
+        response = asyncio.run(server.handle_status(request=None))
+
+        self.assertEqual(
+            response["data"],
+            {
+                "resolution": {"width": 512, "height": 512},
+                "transport": "websocket-tcp",
+                "work": {
+                    "preset": "light",
+                    "output_fps": 15.0,
+                    "input_fps": 15.0,
+                },
+                "jpeg": {
+                    "output_quality": 55,
+                },
+            },
+        )
+
+    def test_prompt_handler_uses_owned_executor_and_runner(self):
+        server = self.make_server()
+        server.start_executor()
+        try:
+            response = asyncio.run(
+                server.handle_prompt(FakeJsonRequest({"prompt": "new prompt"}))
+            )
+        finally:
+            server.shutdown_executor()
+
+        self.assertEqual(response["data"], {"ok": True, "prompt": "new prompt"})
+        self.assertEqual(server.runner.prompts, ["new prompt"])
 
 
 if __name__ == "__main__":
