@@ -6,17 +6,21 @@ RunPod Pods don't support: https://docs.runpod.io/pods/networking — Pods
 are TCP-only). This version carries frames over a plain WebSocket
 instead, which is just TCP, so it works unmodified on a RunPod Pod.
 
-Built to test ONE thing first: real round-trip frame latency over this
-TCP path, with FluxRT in the loop, before deciding whether the full
-two-tier WHIP/WHEP-over-udp-over-tcp architecture is worth building.
+Built to test ONE thing first: live frame cadence and server-observable
+latency over this TCP path, with FluxRT in the loop, before deciding
+whether the full two-tier WHIP/WHEP-over-udp-over-tcp architecture is
+worth building.
 
 Protocol (deliberately minimal):
   - client connects to ws://<host>:<port>/ws
   - client sends binary WebSocket messages, each one a single JPEG-
     encoded frame
-  - server runs each frame through FluxRT, returns the result as a
-    binary WebSocket message (also JPEG)
-  - client measures the round-trip time itself
+  - server writes input frames into FluxRT's input tensor and
+    independently reads the latest output tensor as a binary WebSocket
+    message (also JPEG)
+  - client measures send/receive cadence and latest-send-age timing;
+    exact per-input RTT is not available because frames are untagged and
+    FluxRT input/output loops are decoupled
 
 No WHIP/WHEP, no aiortc, no SDP — none of that machinery is needed or
 used here. This is intentionally the simplest thing that could possibly
@@ -25,8 +29,7 @@ measure "how slow is FluxRT-over-TCP, really."
 Run:
     python server-tcp.py --config configs/stream_processor_config.json --port 8080
 
-Test against it with test_latency_client.py (sends a local video file or
-webcam frames, measures round-trip per frame, prints stats).
+Benchmark against it with benchmark_ws.py before opening TouchDesigner.
 """
 
 import argparse
@@ -34,6 +37,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +53,53 @@ JPEG_QUALITY = 70  # cv2 expects 0-100, matches the 0.7 quality factor
                    # the original Daydream TD extension used for its own
                    # local MJPEG-over-WebSocket relay (JPEG_QUALITY_STREAM)
 OUTPUT_FPS = 25    # match FluxRT demo display pacing and the TD relay SEND_FPS
+
+HOT_PATH_STAGES = (
+    "input_decode",
+    "input_crop_copy",
+    "output_read",
+    "output_encode",
+    "send",
+)
+
+
+class StageTimingWindow:
+    """Small bounded-by-interval timing accumulator for periodic summaries."""
+
+    def __init__(self, stages=HOT_PATH_STAGES):
+        self._samples_ms = {stage: [] for stage in stages}
+
+    def observe_seconds(self, stage: str, elapsed_seconds: float):
+        self._samples_ms.setdefault(stage, []).append(elapsed_seconds * 1000.0)
+
+    def observe_many(self, timings: dict[str, float]):
+        for stage, elapsed_seconds in timings.items():
+            self.observe_seconds(stage, elapsed_seconds)
+
+    def snapshot(self) -> dict[str, dict[str, float | int]]:
+        summary = {}
+        for stage, samples in self._samples_ms.items():
+            summary[stage] = self._summarize(samples)
+            samples.clear()
+        return summary
+
+    @staticmethod
+    def _summarize(samples: list[float]) -> dict[str, float | int]:
+        if not samples:
+            return {"count": 0, "mean_ms": 0.0, "p95_ms": 0.0}
+        ordered = sorted(samples)
+        p95_index = max(0, math.ceil(len(ordered) * 0.95) - 1)
+        return {
+            "count": len(samples),
+            "mean_ms": sum(samples) / len(samples),
+            "p95_ms": ordered[p95_index],
+        }
+
+
+def rate_per_second(count: int, elapsed_seconds: float) -> float:
+    if elapsed_seconds <= 0:
+        return 0.0
+    return count / elapsed_seconds
 
 
 class FluxRTRunner:
@@ -101,21 +152,41 @@ class FluxRTRunner:
         return self.output_tensor.to_numpy()
 
     def write_input_jpeg(self, jpeg_bytes: bytes) -> bool:
+        ok, _timings = self.write_input_jpeg_timed(jpeg_bytes)
+        return ok
+
+    def write_input_jpeg_timed(self, jpeg_bytes: bytes) -> tuple[bool, dict[str, float]]:
+        timings = {}
+        t0 = time.perf_counter()
         np_arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
         frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        timings["input_decode"] = time.perf_counter() - t0
         if frame_bgr is None:
-            return False
+            return False, timings
+
+        t0 = time.perf_counter()
         self.write_input(frame_bgr)
-        return True
+        timings["input_crop_copy"] = time.perf_counter() - t0
+        return True, timings
 
     def read_output_jpeg(self) -> bytes | None:
+        out, _timings = self.read_output_jpeg_timed()
+        return out
+
+    def read_output_jpeg_timed(self) -> tuple[bytes | None, dict[str, float]]:
+        timings = {}
+        t0 = time.perf_counter()
         processed = self.read_output()
+        timings["output_read"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         ok, encoded = cv2.imencode(
             ".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         )
+        timings["output_encode"] = time.perf_counter() - t0
         if not ok:
-            return None
-        return encoded.tobytes()
+            return None, timings
+        return encoded.tobytes(), timings
 
 
 async def handle_ws(request: web.Request):
@@ -144,6 +215,7 @@ async def handle_ws(request: web.Request):
     got_output = asyncio.Event()
     stop_event = asyncio.Event()
     send_lock = asyncio.Lock()
+    timing_window = StageTimingWindow()
     stats = {
         "rx": 0,
         "input_overwritten": 0,
@@ -206,9 +278,10 @@ async def handle_ws(request: web.Request):
                 latest_input["buf"] = None
                 if buf is None:
                     continue
-                ok = await loop.run_in_executor(
-                    executor, runner.write_input_jpeg, buf
+                ok, timings = await loop.run_in_executor(
+                    executor, runner.write_input_jpeg_timed, buf
                 )
+                timing_window.observe_many(timings)
                 if ok:
                     stats["input_written"] += 1
                 else:
@@ -224,7 +297,10 @@ async def handle_ws(request: web.Request):
         try:
             while not stop_event.is_set():
                 t0 = time.perf_counter()
-                out = await loop.run_in_executor(executor, runner.read_output_jpeg)
+                out, timings = await loop.run_in_executor(
+                    executor, runner.read_output_jpeg_timed
+                )
+                timing_window.observe_many(timings)
                 if out is not None:
                     if latest_output["buf"] is not None:
                         stats["output_overwritten"] += 1
@@ -255,7 +331,11 @@ async def handle_ws(request: web.Request):
                 if out is None:
                     continue
                 async with send_lock:
+                    send_t0 = time.perf_counter()
                     await ws.send_bytes(out)
+                    timing_window.observe_seconds(
+                        "send", time.perf_counter() - send_t0
+                    )
                 stats["sent"] += 1
         except (ConnectionResetError, RuntimeError):
             pass
@@ -266,23 +346,58 @@ async def handle_ws(request: web.Request):
 
     async def stats_loop():
         last = stats.copy()
+        last_report_t = time.perf_counter()
         try:
             while not stop_event.is_set():
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop_event.wait(), timeout=5.0)
                 if stop_event.is_set():
                     break
+                now = time.perf_counter()
+                elapsed = now - last_report_t
+                last_report_t = now
                 delta = {k: stats[k] - last[k] for k in stats}
                 last = stats.copy()
+                timings = timing_window.snapshot()
                 log.info(
-                    "ws stats/5s rx=%d wrote=%d sent=%d "
-                    "drop_in=%d drop_out=%d bad_decode=%d",
+                    "ws stats/5s window=%.2fs "
+                    "rx=%d rx_fps=%.2f "
+                    "wrote=%d wrote_fps=%.2f "
+                    "encoded=%d encoded_fps=%.2f "
+                    "sent=%d sent_fps=%.2f "
+                    "drop_in=%d drop_out=%d bad_decode=%d "
+                    "hot_ms input_decode=%.2f/%.2f/%d "
+                    "input_crop_copy=%.2f/%.2f/%d "
+                    "output_read=%.2f/%.2f/%d "
+                    "output_encode=%.2f/%.2f/%d "
+                    "send=%.2f/%.2f/%d",
+                    elapsed,
                     delta["rx"],
+                    rate_per_second(delta["rx"], elapsed),
                     delta["input_written"],
+                    rate_per_second(delta["input_written"], elapsed),
+                    delta["output_encoded"],
+                    rate_per_second(delta["output_encoded"], elapsed),
                     delta["sent"],
+                    rate_per_second(delta["sent"], elapsed),
                     delta["input_overwritten"],
                     delta["output_overwritten"],
                     delta["decode_failed"],
+                    timings["input_decode"]["mean_ms"],
+                    timings["input_decode"]["p95_ms"],
+                    timings["input_decode"]["count"],
+                    timings["input_crop_copy"]["mean_ms"],
+                    timings["input_crop_copy"]["p95_ms"],
+                    timings["input_crop_copy"]["count"],
+                    timings["output_read"]["mean_ms"],
+                    timings["output_read"]["p95_ms"],
+                    timings["output_read"]["count"],
+                    timings["output_encode"]["mean_ms"],
+                    timings["output_encode"]["p95_ms"],
+                    timings["output_encode"]["count"],
+                    timings["send"]["mean_ms"],
+                    timings["send"]["p95_ms"],
+                    timings["send"]["count"],
                 )
         finally:
             log.info(

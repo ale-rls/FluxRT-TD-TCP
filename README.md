@@ -50,6 +50,7 @@ They never wait for each other, mirroring FluxRT's shared-memory design.
 |------|---------|---------|
 | `setup.sh` | GPU box | One-shot VM setup (miniconda, git-lfs, clone + install FluxRT) |
 | `server-tcp.py` | GPU box | WebSocket server wrapping FluxRT's `StreamProcessor` |
+| `benchmark_ws.py` | Laptop / operator machine | Pre-TouchDesigner websocket benchmark client |
 | `td_fluxrt_ext_tcp.py` | TouchDesigner | Extension: lifecycle, serves the relay page, streams input frames |
 | `fluxrt_tcp_relay.html` | TouchDesigner (in `web_render`) | Bridges local input frames ↔ remote server, displays output |
 
@@ -164,5 +165,53 @@ In `server-tcp.py` / `fluxrt_tcp_relay.html`:
   rate to avoid resampling stutter.
 - **`JPEG_QUALITY`** — input quality can go lower (the model transforms it
   anyway); keep output quality higher since that's what's displayed.
+
+## Runtime stats
+
+`server-tcp.py` logs one WebSocket summary every 5 seconds, with frame counts,
+measured FPS/cadence, latest-wins drops, bad JPEG decodes, and hot-path
+timings:
+
+```
+ws stats/5s window=...s rx=... rx_fps=... wrote=... wrote_fps=...
+  encoded=... encoded_fps=... sent=... sent_fps=...
+  drop_in=... drop_out=... bad_decode=...
+  hot_ms input_decode=mean/p95/count
+  input_crop_copy=mean/p95/count output_read=mean/p95/count
+  output_encode=mean/p95/count send=mean/p95/count
+```
+
+For benchmarking, compare `rx_fps` with `wrote_fps` to see receive pressure
+versus accepted FluxRT input cadence, and compare `encoded_fps` with `sent_fps`
+plus `drop_out` to spot network backpressure. The `hot_ms` fields are
+`mean/p95/count` latencies in milliseconds for the server-observable stages:
+input JPEG decode, input crop/copy into FluxRT, output tensor read, JPEG encode,
+and websocket send wait.
+
+## Pre-TouchDesigner benchmark
+
+Before opening TouchDesigner, run a real backend and drive the same websocket
+API with synthetic JPEG frames:
+
+```bash
+python3 benchmark_ws.py ws://127.0.0.1:8080/ws \
+  --width 512 --height 512 --fps 25 --duration 30
+```
+
+For Modal, use the `wss://.../ws` URL printed by `modal serve`, `modal deploy`,
+or the optional tunnel. The benchmark script itself does not need FluxRT weights
+locally; weights are only needed by the server it connects to. It uses `aiohttp`
+for websocket transport and OpenCV+NumPy, or Pillow, to generate JPEG frames.
+
+Client output reports elapsed time, active send/receive windows, frames
+sent/received, send/receive FPS for the active send window, the simple
+`sent_minus_received` count delta, and `latest_send_age_ms` mean/p50/p95/max.
+Connection setup and post-send receive drain do not dilute the headline FPS
+numbers. Because the server protocol intentionally does not tag frames and
+FluxRT input/output loops are decoupled, that latency is the age since the
+latest client send when a binary response arrived, not a strict per-input model
+round trip. Pair it with the server's `ws stats/5s` `hot_ms` fields to separate
+network pressure, server CPU/shared-memory costs, and FluxRT output cadence
+across runs.
 
 ---
