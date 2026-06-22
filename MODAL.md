@@ -88,7 +88,7 @@ frames from your laptop:
 
 ```bash
 python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
-  --width 512 --height 512 --fps 25 --duration 30
+  --benchmark-preset baseline --duration 30
 ```
 
 The script reports client-observed send/receive FPS over the active send
@@ -100,6 +100,23 @@ backend's 5-second `ws stats/5s` `hot_ms` summaries to separate websocket
 pressure from server decode/crop/read/encode/send costs. Run the same command
 against the optional tunnel URL to compare `modal.run` and `modal.host` before
 opening TouchDesigner.
+
+For a lower-work comparison, set `SERVER_WORK_PRESET = "light"` in
+`modal_app.py`, then `modal serve modal_app.py` or `modal deploy modal_app.py`
+again and rerun:
+
+```bash
+python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
+  --benchmark-preset light --duration 30
+```
+
+Compare each run's client `send_fps`, `receive_fps`, and `latest_send_age_ms`
+p50/p95 with the server `ws stats/5s` line: `rx_fps` vs. `wrote_fps`,
+`encoded_fps` vs. `sent_fps`, `drop_in`, `drop_out`, and `hot_ms` means/p95s.
+Use the lighter preset for TouchDesigner only if the benchmark improves latency
+or steadiness enough to justify the lower send/display cadence. All benchmark
+presets keep the real TouchDesigner relay geometry, 512x512; use explicit
+`--width` and `--height` only for a separate JPEG/network/decode experiment.
 
 Modal only allows `routing_region` to be set when a Function is first created.
 If you already deployed this app before the `eu-west` routing change and Modal
@@ -178,10 +195,13 @@ drop the warm container.
   making Modal `modal.run` vs. `modal.host` tunnel runs directly comparable.
 - **WebSocket lifetime.** A connection is capped by the function `timeout` (set
   to 6 h). If it's recycled, the relay auto-reconnects within ~1 s.
-- **Tuning** (`interpolation_exp`, `target_fps`, `resolution`) lives in
-  `configs/stream_processor_config.json` inside the FluxRT clone. To override it,
-  edit a local copy and add it to the image (`.add_local_file(...)` in
-  `modal_app.py`), then redeploy.
+- **Tuning.** Server-side cadence presets live near the top of `modal_app.py`:
+  `SERVER_WORK_PRESET = "default"`, `"light"`, or `"low"`, with optional
+  `SERVER_OUTPUT_FPS` and `SERVER_INPUT_FPS` overrides. FluxRT model tuning
+  (`interpolation_exp`, `target_fps`, `resolution`) still lives in
+  `configs/stream_processor_config.json` inside the FluxRT clone. To override
+  FluxRT's own config, edit a local copy and add it to the image
+  (`.add_local_file(...)` in `modal_app.py`), then redeploy.
 - **No HF token needed** — all FluxRT model repos are public. If one ever goes
   gated, add a `modal.Secret` with `HF_TOKEN` and pass it to `download_weights`.
 - **CUDA image tag.** If `nvidia/cuda:12.8.0-devel-ubuntu22.04` fails to pull,

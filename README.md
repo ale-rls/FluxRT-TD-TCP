@@ -160,9 +160,19 @@ In `configs/stream_processor_config.json`:
 
 In `server-tcp.py` / `fluxrt_tcp_relay.html`:
 
-- **`OUTPUT_FPS`** (server) and **`SEND_FPS`** (relay) — steady in/out rates,
-  default 25. Keep them aligned with each other and roughly with RIFE's output
-  rate to avoid resampling stutter.
+- **Server work preset** — start the server with
+  `--work-preset default|light|low`, or set `FLUXRT_WORK_PRESET`. `default`
+  preserves the original 25fps output loop and uncapped latest-wins input
+  writes. `light` caps server output reads/encodes and input decode/crop/copy
+  work to 15fps; `low` caps both to 10fps.
+- **`--output-fps` / `FLUXRT_OUTPUT_FPS`** — overrides the preset's server
+  output tensor read/JPEG send cadence.
+- **`--input-fps` / `FLUXRT_INPUT_FPS`** — overrides the preset's FluxRT input
+  tensor write cadence. `0` keeps the original uncapped latest-wins input
+  behavior.
+- **`SEND_FPS`** (relay) — TouchDesigner relay input send rate, default 25.
+  For a tuned show run, keep it close to the server input/output caps you chose
+  to avoid oversending frames that will be dropped.
 - **`JPEG_QUALITY`** — input quality can go lower (the model transforms it
   anyway); keep output quality higher since that's what's displayed.
 
@@ -195,13 +205,28 @@ API with synthetic JPEG frames:
 
 ```bash
 python3 benchmark_ws.py ws://127.0.0.1:8080/ws \
-  --width 512 --height 512 --fps 25 --duration 30
+  --benchmark-preset baseline --duration 30
+```
+
+Then restart the server with a lower-work preset and run the matching client
+preset:
+
+```bash
+python server-tcp.py --config configs/stream_processor_config.json \
+  --port 8080 --work-preset light
+
+python3 benchmark_ws.py ws://127.0.0.1:8080/ws \
+  --benchmark-preset light --duration 30
 ```
 
 For Modal, use the `wss://.../ws` URL printed by `modal serve`, `modal deploy`,
 or the optional tunnel. The benchmark script itself does not need FluxRT weights
 locally; weights are only needed by the server it connects to. It uses `aiohttp`
 for websocket transport and OpenCV+NumPy, or Pillow, to generate JPEG frames.
+The `baseline`, `light`, and `low` benchmark presets all keep the real
+TouchDesigner relay geometry, 512x512. To test smaller input frames as a
+separate JPEG/network/decode experiment, pass explicit `--width` and `--height`
+overrides and label that run separately from cadence tuning.
 
 Client output reports elapsed time, active send/receive windows, frames
 sent/received, send/receive FPS for the active send window, the simple
@@ -212,6 +237,10 @@ FluxRT input/output loops are decoupled, that latency is the age since the
 latest client send when a binary response arrived, not a strict per-input model
 round trip. Pair it with the server's `ws stats/5s` `hot_ms` fields to separate
 network pressure, server CPU/shared-memory costs, and FluxRT output cadence
-across runs.
+across runs. Compare baseline vs. `light` before opening TouchDesigner:
+
+- Client: `send_fps`, `receive_fps`, and `latest_send_age_ms` p50/p95.
+- Server: `rx_fps` vs. `wrote_fps`, `encoded_fps` vs. `sent_fps`, `drop_in`,
+  `drop_out`, and the `hot_ms` stage means/p95s.
 
 ---

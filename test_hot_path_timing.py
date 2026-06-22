@@ -60,5 +60,66 @@ class StageTimingWindowTest(unittest.TestCase):
         self.assertEqual(server_tcp.rate_per_second(125, 0.0), 0.0)
 
 
+class WorkConfigTest(unittest.TestCase):
+    def test_default_work_config_preserves_existing_output_and_uncapped_input(self):
+        config = server_tcp.build_work_config(environ={})
+
+        self.assertEqual(config.preset, "default")
+        self.assertEqual(config.output_fps, 25.0)
+        self.assertEqual(config.input_fps, 0.0)
+        self.assertEqual(config.output_interval, 1.0 / 25.0)
+        self.assertEqual(config.input_interval, 0.0)
+
+    def test_light_preset_caps_input_and_output_work(self):
+        config = server_tcp.build_work_config(preset="light", environ={})
+
+        self.assertEqual(config.preset, "light")
+        self.assertEqual(config.output_fps, 15.0)
+        self.assertEqual(config.input_fps, 15.0)
+        self.assertEqual(config.input_interval, 1.0 / 15.0)
+
+    def test_env_and_cli_overrides_take_precedence(self):
+        config = server_tcp.build_work_config(
+            preset="light",
+            output_fps=12.0,
+            input_fps=8.0,
+            environ={
+                "FLUXRT_WORK_PRESET": "low",
+                "FLUXRT_OUTPUT_FPS": "20",
+                "FLUXRT_INPUT_FPS": "10",
+            },
+        )
+
+        self.assertEqual(config.preset, "light")
+        self.assertEqual(config.output_fps, 12.0)
+        self.assertEqual(config.input_fps, 8.0)
+
+    def test_invalid_work_config_is_rejected(self):
+        with self.assertRaises(ValueError):
+            server_tcp.build_work_config(preset="fast", environ={})
+
+        with self.assertRaises(ValueError):
+            server_tcp.build_work_config(output_fps=0, environ={})
+
+        with self.assertRaises(ValueError):
+            server_tcp.build_work_config(input_fps=-1, environ={})
+
+    def test_non_finite_work_config_values_are_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(
+                        environ={"FLUXRT_OUTPUT_FPS": value}
+                    )
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(environ={"FLUXRT_INPUT_FPS": value})
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(
+                        output_fps=float(value), environ={}
+                    )
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(input_fps=float(value), environ={})
+
+
 if __name__ == "__main__":
     unittest.main()
