@@ -150,6 +150,11 @@ drop the warm container.
   optional `modal.host` tunnel before committing to it for a show. A pre-warmed
   `min_containers=1` container removes cold-start variance but does not change
   network round-trip time.
+- **Runtime stats.** The backend logs one `ws stats/5s` line per connected
+  client. Besides frame counts and latest-wins drops, `hot_ms` fields are
+  `mean/p95/count` for `input_decode`, `input_crop_copy`, `output_read`,
+  `output_encode`, and websocket `send`; use these to distinguish network
+  backpressure from local server CPU/shared-memory work.
 - **WebSocket lifetime.** A connection is capped by the function `timeout` (set
   to 6 h). If it's recycled, the relay auto-reconnects within ~1 s.
 - **Tuning** (`interpolation_exp`, `target_fps`, `resolution`) lives in

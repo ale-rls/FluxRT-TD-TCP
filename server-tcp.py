@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,47 @@ JPEG_QUALITY = 70  # cv2 expects 0-100, matches the 0.7 quality factor
                    # the original Daydream TD extension used for its own
                    # local MJPEG-over-WebSocket relay (JPEG_QUALITY_STREAM)
 OUTPUT_FPS = 25    # match FluxRT demo display pacing and the TD relay SEND_FPS
+
+HOT_PATH_STAGES = (
+    "input_decode",
+    "input_crop_copy",
+    "output_read",
+    "output_encode",
+    "send",
+)
+
+
+class StageTimingWindow:
+    """Small bounded-by-interval timing accumulator for periodic summaries."""
+
+    def __init__(self, stages=HOT_PATH_STAGES):
+        self._samples_ms = {stage: [] for stage in stages}
+
+    def observe_seconds(self, stage: str, elapsed_seconds: float):
+        self._samples_ms.setdefault(stage, []).append(elapsed_seconds * 1000.0)
+
+    def observe_many(self, timings: dict[str, float]):
+        for stage, elapsed_seconds in timings.items():
+            self.observe_seconds(stage, elapsed_seconds)
+
+    def snapshot(self) -> dict[str, dict[str, float | int]]:
+        summary = {}
+        for stage, samples in self._samples_ms.items():
+            summary[stage] = self._summarize(samples)
+            samples.clear()
+        return summary
+
+    @staticmethod
+    def _summarize(samples: list[float]) -> dict[str, float | int]:
+        if not samples:
+            return {"count": 0, "mean_ms": 0.0, "p95_ms": 0.0}
+        ordered = sorted(samples)
+        p95_index = max(0, math.ceil(len(ordered) * 0.95) - 1)
+        return {
+            "count": len(samples),
+            "mean_ms": sum(samples) / len(samples),
+            "p95_ms": ordered[p95_index],
+        }
 
 
 class FluxRTRunner:
@@ -101,21 +143,41 @@ class FluxRTRunner:
         return self.output_tensor.to_numpy()
 
     def write_input_jpeg(self, jpeg_bytes: bytes) -> bool:
+        ok, _timings = self.write_input_jpeg_timed(jpeg_bytes)
+        return ok
+
+    def write_input_jpeg_timed(self, jpeg_bytes: bytes) -> tuple[bool, dict[str, float]]:
+        timings = {}
+        t0 = time.perf_counter()
         np_arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
         frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        timings["input_decode"] = time.perf_counter() - t0
         if frame_bgr is None:
-            return False
+            return False, timings
+
+        t0 = time.perf_counter()
         self.write_input(frame_bgr)
-        return True
+        timings["input_crop_copy"] = time.perf_counter() - t0
+        return True, timings
 
     def read_output_jpeg(self) -> bytes | None:
+        out, _timings = self.read_output_jpeg_timed()
+        return out
+
+    def read_output_jpeg_timed(self) -> tuple[bytes | None, dict[str, float]]:
+        timings = {}
+        t0 = time.perf_counter()
         processed = self.read_output()
+        timings["output_read"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         ok, encoded = cv2.imencode(
             ".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         )
+        timings["output_encode"] = time.perf_counter() - t0
         if not ok:
-            return None
-        return encoded.tobytes()
+            return None, timings
+        return encoded.tobytes(), timings
 
 
 async def handle_ws(request: web.Request):
@@ -144,6 +206,7 @@ async def handle_ws(request: web.Request):
     got_output = asyncio.Event()
     stop_event = asyncio.Event()
     send_lock = asyncio.Lock()
+    timing_window = StageTimingWindow()
     stats = {
         "rx": 0,
         "input_overwritten": 0,
@@ -206,9 +269,10 @@ async def handle_ws(request: web.Request):
                 latest_input["buf"] = None
                 if buf is None:
                     continue
-                ok = await loop.run_in_executor(
-                    executor, runner.write_input_jpeg, buf
+                ok, timings = await loop.run_in_executor(
+                    executor, runner.write_input_jpeg_timed, buf
                 )
+                timing_window.observe_many(timings)
                 if ok:
                     stats["input_written"] += 1
                 else:
@@ -224,7 +288,10 @@ async def handle_ws(request: web.Request):
         try:
             while not stop_event.is_set():
                 t0 = time.perf_counter()
-                out = await loop.run_in_executor(executor, runner.read_output_jpeg)
+                out, timings = await loop.run_in_executor(
+                    executor, runner.read_output_jpeg_timed
+                )
+                timing_window.observe_many(timings)
                 if out is not None:
                     if latest_output["buf"] is not None:
                         stats["output_overwritten"] += 1
@@ -255,7 +322,11 @@ async def handle_ws(request: web.Request):
                 if out is None:
                     continue
                 async with send_lock:
+                    send_t0 = time.perf_counter()
                     await ws.send_bytes(out)
+                    timing_window.observe_seconds(
+                        "send", time.perf_counter() - send_t0
+                    )
                 stats["sent"] += 1
         except (ConnectionResetError, RuntimeError):
             pass
@@ -274,15 +345,37 @@ async def handle_ws(request: web.Request):
                     break
                 delta = {k: stats[k] - last[k] for k in stats}
                 last = stats.copy()
+                timings = timing_window.snapshot()
                 log.info(
-                    "ws stats/5s rx=%d wrote=%d sent=%d "
-                    "drop_in=%d drop_out=%d bad_decode=%d",
+                    "ws stats/5s rx=%d wrote=%d encoded=%d sent=%d "
+                    "drop_in=%d drop_out=%d bad_decode=%d "
+                    "hot_ms input_decode=%.2f/%.2f/%d "
+                    "input_crop_copy=%.2f/%.2f/%d "
+                    "output_read=%.2f/%.2f/%d "
+                    "output_encode=%.2f/%.2f/%d "
+                    "send=%.2f/%.2f/%d",
                     delta["rx"],
                     delta["input_written"],
+                    delta["output_encoded"],
                     delta["sent"],
                     delta["input_overwritten"],
                     delta["output_overwritten"],
                     delta["decode_failed"],
+                    timings["input_decode"]["mean_ms"],
+                    timings["input_decode"]["p95_ms"],
+                    timings["input_decode"]["count"],
+                    timings["input_crop_copy"]["mean_ms"],
+                    timings["input_crop_copy"]["p95_ms"],
+                    timings["input_crop_copy"]["count"],
+                    timings["output_read"]["mean_ms"],
+                    timings["output_read"]["p95_ms"],
+                    timings["output_read"]["count"],
+                    timings["output_encode"]["mean_ms"],
+                    timings["output_encode"]["p95_ms"],
+                    timings["output_encode"]["count"],
+                    timings["send"]["mean_ms"],
+                    timings["send"]["p95_ms"],
+                    timings["send"]["count"],
                 )
         finally:
             log.info(

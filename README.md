@@ -165,4 +165,20 @@ In `server-tcp.py` / `fluxrt_tcp_relay.html`:
 - **`JPEG_QUALITY`** — input quality can go lower (the model transforms it
   anyway); keep output quality higher since that's what's displayed.
 
+## Runtime stats
+
+`server-tcp.py` logs one WebSocket summary every 5 seconds, with frame counts,
+latest-wins drops, bad JPEG decodes, and hot-path timings:
+
+```
+ws stats/5s rx=... wrote=... encoded=... sent=... drop_in=... drop_out=...
+  bad_decode=... hot_ms input_decode=mean/p95/count
+  input_crop_copy=mean/p95/count output_read=mean/p95/count
+  output_encode=mean/p95/count send=mean/p95/count
+```
+
+Use `drop_out`, `sent`, and `send` timing to spot network/backpressure issues;
+use `input_decode`, `input_crop_copy`, `output_read`, and `output_encode` to
+separate local server CPU/shared-memory costs from FluxRT's own output cadence.
+
 ---
