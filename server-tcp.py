@@ -102,6 +102,8 @@ def positive_float(value: str, name: str) -> float:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
     if parsed <= 0:
         raise ValueError(f"{name} must be positive")
     return parsed
@@ -112,6 +114,8 @@ def non_negative_float(value: str, name: str) -> float:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
     if parsed < 0:
         raise ValueError(f"{name} must be non-negative")
     return parsed
@@ -142,13 +146,9 @@ def build_work_config(
         resolved_input_fps = non_negative_float(env["FLUXRT_INPUT_FPS"], "FLUXRT_INPUT_FPS")
 
     if output_fps is not None:
-        if output_fps <= 0:
-            raise ValueError("--output-fps must be positive")
-        resolved_output_fps = float(output_fps)
+        resolved_output_fps = positive_float(str(output_fps), "--output-fps")
     if input_fps is not None:
-        if input_fps < 0:
-            raise ValueError("--input-fps must be non-negative")
-        resolved_input_fps = float(input_fps)
+        resolved_input_fps = non_negative_float(str(input_fps), "--input-fps")
 
     return WorkConfig(
         preset=selected_preset,

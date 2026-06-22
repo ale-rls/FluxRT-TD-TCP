@@ -25,14 +25,14 @@ BENCHMARK_PRESETS = {
         "quality": 70,
     },
     "light": {
-        "width": 384,
-        "height": 384,
+        "width": 512,
+        "height": 512,
         "fps": 15.0,
         "quality": 70,
     },
     "low": {
-        "width": 320,
-        "height": 320,
+        "width": 512,
+        "height": 512,
         "fps": 10.0,
         "quality": 70,
     },
@@ -50,6 +50,12 @@ def rate_per_second(count: int, elapsed_seconds: float) -> float:
     if elapsed_seconds <= 0:
         return 0.0
     return count / elapsed_seconds
+
+
+def require_finite(value: float, name: str) -> float:
+    if not math.isfinite(value):
+        raise SystemExit(f"{name} must be finite")
+    return value
 
 
 def summarize_ms(samples_seconds: list[float]) -> dict[str, float | int]:
@@ -252,6 +258,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.fps = preset["fps"]
     if args.quality is None:
         args.quality = preset["quality"]
+
+    require_finite(float(args.fps), "--fps")
+    require_finite(float(args.duration), "--duration")
+    require_finite(float(args.receive_drain), "--receive-drain")
+    require_finite(float(args.max_message_mb), "--max-message-mb")
 
     if args.width <= 0 or args.height <= 0:
         raise SystemExit("--width and --height must be positive")

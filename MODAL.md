@@ -114,7 +114,9 @@ Compare each run's client `send_fps`, `receive_fps`, and `latest_send_age_ms`
 p50/p95 with the server `ws stats/5s` line: `rx_fps` vs. `wrote_fps`,
 `encoded_fps` vs. `sent_fps`, `drop_in`, `drop_out`, and `hot_ms` means/p95s.
 Use the lighter preset for TouchDesigner only if the benchmark improves latency
-or steadiness enough to justify the lower send/display cadence.
+or steadiness enough to justify the lower send/display cadence. All benchmark
+presets keep the real TouchDesigner relay geometry, 512x512; use explicit
+`--width` and `--height` only for a separate JPEG/network/decode experiment.
 
 Modal only allows `routing_region` to be set when a Function is first created.
 If you already deployed this app before the `eu-west` routing change and Modal

@@ -104,6 +104,22 @@ class WorkConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             server_tcp.build_work_config(input_fps=-1, environ={})
 
+    def test_non_finite_work_config_values_are_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(
+                        environ={"FLUXRT_OUTPUT_FPS": value}
+                    )
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(environ={"FLUXRT_INPUT_FPS": value})
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(
+                        output_fps=float(value), environ={}
+                    )
+                with self.assertRaises(ValueError):
+                    server_tcp.build_work_config(input_fps=float(value), environ={})
+
 
 if __name__ == "__main__":
     unittest.main()

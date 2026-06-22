@@ -103,8 +103,8 @@ class BenchmarkWsHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(args.benchmark_preset, "light")
-        self.assertEqual(args.width, 384)
-        self.assertEqual(args.height, 384)
+        self.assertEqual(args.width, 512)
+        self.assertEqual(args.height, 512)
         self.assertEqual(args.fps, 15.0)
         self.assertEqual(args.quality, 70)
 
@@ -122,8 +122,27 @@ class BenchmarkWsHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(args.width, 512)
-        self.assertEqual(args.height, 320)
+        self.assertEqual(args.height, 512)
         self.assertEqual(args.fps, 12)
+
+    def test_benchmark_presets_keep_touchdesigner_frame_geometry(self):
+        for preset in ("baseline", "light", "low"):
+            with self.subTest(preset=preset):
+                args = benchmark_ws.parse_args(
+                    ["ws://127.0.0.1:8080/ws", "--benchmark-preset", preset]
+                )
+
+                self.assertEqual(args.width, 512)
+                self.assertEqual(args.height, 512)
+
+    def test_parse_args_rejects_non_finite_benchmark_numbers(self):
+        for option in ("--fps", "--duration", "--receive-drain"):
+            for value in ("nan", "inf", "-inf"):
+                with self.subTest(option=option, value=value):
+                    with self.assertRaises(SystemExit):
+                        benchmark_ws.parse_args(
+                            ["ws://127.0.0.1:8080/ws", f"{option}={value}"]
+                        )
 
 
 if __name__ == "__main__":

@@ -223,6 +223,10 @@ For Modal, use the `wss://.../ws` URL printed by `modal serve`, `modal deploy`,
 or the optional tunnel. The benchmark script itself does not need FluxRT weights
 locally; weights are only needed by the server it connects to. It uses `aiohttp`
 for websocket transport and OpenCV+NumPy, or Pillow, to generate JPEG frames.
+The `baseline`, `light`, and `low` benchmark presets all keep the real
+TouchDesigner relay geometry, 512x512. To test smaller input frames as a
+separate JPEG/network/decode experiment, pass explicit `--width` and `--height`
+overrides and label that run separately from cadence tuning.
 
 Client output reports elapsed time, active send/receive windows, frames
 sent/received, send/receive FPS for the active send window, the simple
