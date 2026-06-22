@@ -28,7 +28,8 @@ Usage (see MODAL.md for the full walkthrough). Run from the repo root:
     pip install modal && modal token new
     modal run   modal_app.py::download_weights     # one-time, fills the Volume
     modal serve modal_app.py                        # dev: warm while running
-    modal deploy modal_app.py                       # persistent endpoint
+    modal deploy modal_app.py                       # persistent routed endpoint
+    modal run   modal_app.py::serve_tunnel          # optional direct tunnel
 Then point TouchDesigner's `Serverurl` at  wss://<...>.modal.run/ws .
 """
 
@@ -45,14 +46,16 @@ import modal
 GPU = "A100-80GB"
 USE_INT8 = False
 
-# Cloud region for the container. Kept None (Modal default, ~US) ON PURPOSE:
-# pinning "eu" did NOT lower round-trip for an EU user here — Modal's
-# web-endpoint TLS edge stayed ~120ms away regardless of container region, and
-# an EU container away from that US edge can add a hop. The ~200-250ms proxy
-# round-trip is the web-endpoint floor from Europe. If that floor is too high:
-# try "eu"/"eu-west" (1.5-1.75x cost), Modal Tunnels (raw TCP, skips the HTTP
-# edge), or keep RunPod for a direct pod. Valid: "eu","eu-west","us-east",...
-REGION = None
+# Region for the GPU container. A narrow region has Modal's higher regional
+# pricing multiplier but avoids a US GPU hop for Berlin/EU clients. Set to None
+# to let Modal choose the cheapest/most available region.
+GPU_REGION = "eu-west"
+
+# Region for Modal Function input/output routing. Modal defaults this to
+# us-east; eu-west keeps the public WebSocket edge in Europe. Modal currently
+# allows routing_region changes only on a newly-created Function, so if an
+# existing deployment rejects this, deploy under a new app/function name.
+WEB_ROUTING_REGION = "eu-west"
 
 APP_NAME = "fluxrt-tcp"
 PORT = 8080
@@ -136,7 +139,8 @@ def download_weights():
 @app.function(
     image=image,
     gpu=GPU,
-    region=REGION,
+    region=GPU_REGION,
+    routing_region=WEB_ROUTING_REGION,
     volumes={WEIGHTS_DIR: weights},
     # A WS connection is one input that lives for the whole show; give it
     # plenty of room. The relay auto-reconnects if a connection is recycled.
@@ -159,6 +163,37 @@ def serve():
     """Launch server-tcp.py inside the container; Modal proxies HTTPS/WSS to
     PORT. Non-blocking (Popen) so Modal can detect the port once FluxRT has
     finished warming up."""
+    _start_fluxrt_server()
+
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    region=GPU_REGION,
+    volumes={WEIGHTS_DIR: weights},
+    timeout=60 * 60 * 6,
+    scaledown_window=60 * 20,
+    max_containers=1,
+)
+def serve_tunnel():
+    """Launch server-tcp.py behind a Modal Tunnel for a direct low-latency
+    rehearsal path. Run with:
+
+        modal run modal_app.py::serve_tunnel
+
+    Copy the printed wss://.../ws URL into TouchDesigner. The tunnel exists
+    only while this function is running.
+    """
+    with modal.forward(PORT) as tunnel:
+        ws_url = tunnel.url.replace("https://", "wss://", 1) + "/ws"
+        print(f"[tunnel] HTTPS status/prompt base: {tunnel.url}")
+        print(f"[tunnel] TouchDesigner Serverurl: {ws_url}")
+        process = _start_fluxrt_server()
+        process.wait()
+
+
+def _start_fluxrt_server():
+    """Symlink weights and start the FluxRT aiohttp server."""
     import os
     import subprocess
 
@@ -177,4 +212,4 @@ def serve():
     if USE_INT8:
         cmd.append("--int8")
     # server-tcp.py binds 0.0.0.0 by default — required for web_server.
-    subprocess.Popen(cmd, cwd=FLUXRT_DIR)
+    return subprocess.Popen(cmd, cwd=FLUXRT_DIR)

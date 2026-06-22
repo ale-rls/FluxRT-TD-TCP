@@ -13,7 +13,9 @@ VS Code tunnel.
 
 > **Deploying on Modal instead of a RunPod Pod?** See **[MODAL.md](MODAL.md)** —
 > the same `server-tcp.py`, packaged as a Modal app on a warm GPU and served
-> over `wss://…modal.run`. No VM to provision, no TCP port to expose, no tunnel.
+> over `wss://…modal.run`. The Modal config defaults to EU web routing/GPU
+> placement for Berlin/Europe latency tests and also documents an optional
+> temporary Modal Tunnel path.
 
 ---
 
