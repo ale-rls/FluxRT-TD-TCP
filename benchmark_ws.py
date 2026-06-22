@@ -17,6 +17,27 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 
+BENCHMARK_PRESETS = {
+    "baseline": {
+        "width": 512,
+        "height": 512,
+        "fps": 25.0,
+        "quality": 70,
+    },
+    "light": {
+        "width": 384,
+        "height": 384,
+        "fps": 15.0,
+        "quality": 70,
+    },
+    "low": {
+        "width": 320,
+        "height": 320,
+        "fps": 10.0,
+        "quality": 70,
+    },
+}
+
 
 def percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
@@ -189,11 +210,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Benchmark the FluxRT websocket path before opening TouchDesigner"
     )
     parser.add_argument("url", help="WebSocket URL, e.g. wss://.../ws")
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--fps", type=float, default=25.0)
+    parser.add_argument(
+        "--benchmark-preset",
+        choices=sorted(BENCHMARK_PRESETS),
+        default="baseline",
+        help="Client frame preset. Explicit --width/--height/--fps/--quality override it.",
+    )
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--duration", type=float, default=30.0)
-    parser.add_argument("--quality", type=int, default=70)
+    parser.add_argument("--quality", type=int, default=None)
     parser.add_argument(
         "--receive-drain",
         type=float,
@@ -216,6 +243,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = build_parser().parse_args(argv)
+    preset = BENCHMARK_PRESETS[args.benchmark_preset]
+    if args.width is None:
+        args.width = preset["width"]
+    if args.height is None:
+        args.height = preset["height"]
+    if args.fps is None:
+        args.fps = preset["fps"]
+    if args.quality is None:
+        args.quality = preset["quality"]
+
     if args.width <= 0 or args.height <= 0:
         raise SystemExit("--width and --height must be positive")
     if args.fps <= 0:
@@ -300,11 +337,27 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
             await asyncio.gather(send_loop(), receive_loop())
 
     elapsed = time.perf_counter() - benchmark_started_at
-    return recorder.summary(args.duration, elapsed)
+    summary = recorder.summary(args.duration, elapsed)
+    summary.update(
+        {
+            "benchmark_preset": args.benchmark_preset,
+            "frame_width": args.width,
+            "frame_height": args.height,
+            "requested_send_fps": args.fps,
+            "jpeg_quality": args.quality,
+        }
+    )
+    return summary
 
 
 def print_text_summary(summary: dict):
     latency = summary["latest_send_age_ms"]
+    print(
+        "preset={benchmark_preset} frame={frame_width}x{frame_height} "
+        "requested_send_fps={requested_send_fps:.2f} quality={jpeg_quality}".format(
+            **summary
+        )
+    )
     print(
         "elapsed={elapsed_s:.2f}s requested={requested_duration_s:.2f}s "
         "send_window={send_window_s:.2f}s receive_window={receive_window_s:.2f}s "

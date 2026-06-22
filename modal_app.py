@@ -46,6 +46,13 @@ import modal
 GPU = "A100-80GB"
 USE_INT8 = False
 
+# Server-side work tuning. "default" preserves the original 25fps output loop
+# and uncapped latest-wins input writes. "light" and "low" reduce server
+# decode/crop/read/encode work for benchmark runs before opening TouchDesigner.
+SERVER_WORK_PRESET = "default"
+SERVER_OUTPUT_FPS = None
+SERVER_INPUT_FPS = None
+
 # Region for the GPU container. A narrow region has Modal's higher regional
 # pricing multiplier but avoids a US GPU hop for Berlin/EU clients. Set to None
 # to let Modal choose the cheapest/most available region.
@@ -208,7 +215,12 @@ def _start_fluxrt_server():
         "python", "server-tcp.py",
         "--config", "configs/stream_processor_config.json",
         "--port", str(PORT),
+        "--work-preset", SERVER_WORK_PRESET,
     ]
+    if SERVER_OUTPUT_FPS is not None:
+        cmd.extend(["--output-fps", str(SERVER_OUTPUT_FPS)])
+    if SERVER_INPUT_FPS is not None:
+        cmd.extend(["--input-fps", str(SERVER_INPUT_FPS)])
     if USE_INT8:
         cmd.append("--int8")
     # server-tcp.py binds 0.0.0.0 by default — required for web_server.

@@ -38,9 +38,11 @@ import contextlib
 import json
 import logging
 import math
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -54,6 +56,21 @@ JPEG_QUALITY = 70  # cv2 expects 0-100, matches the 0.7 quality factor
                    # local MJPEG-over-WebSocket relay (JPEG_QUALITY_STREAM)
 OUTPUT_FPS = 25    # match FluxRT demo display pacing and the TD relay SEND_FPS
 
+WORK_PRESETS = {
+    "default": {
+        "output_fps": OUTPUT_FPS,
+        "input_fps": 0.0,
+    },
+    "light": {
+        "output_fps": 15.0,
+        "input_fps": 15.0,
+    },
+    "low": {
+        "output_fps": 10.0,
+        "input_fps": 10.0,
+    },
+}
+
 HOT_PATH_STAGES = (
     "input_decode",
     "input_crop_copy",
@@ -61,6 +78,83 @@ HOT_PATH_STAGES = (
     "output_encode",
     "send",
 )
+
+
+@dataclass(frozen=True)
+class WorkConfig:
+    preset: str
+    output_fps: float
+    input_fps: float
+
+    @property
+    def output_interval(self) -> float:
+        return 1.0 / self.output_fps
+
+    @property
+    def input_interval(self) -> float:
+        if self.input_fps <= 0:
+            return 0.0
+        return 1.0 / self.input_fps
+
+
+def positive_float(value: str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive")
+    return parsed
+
+
+def non_negative_float(value: str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def build_work_config(
+    *,
+    preset: str | None = None,
+    output_fps: float | None = None,
+    input_fps: float | None = None,
+    environ: dict[str, str] | None = None,
+) -> WorkConfig:
+    env = os.environ if environ is None else environ
+    selected_preset = (
+        preset or env.get("FLUXRT_WORK_PRESET") or "default"
+    ).strip().lower()
+    if selected_preset not in WORK_PRESETS:
+        choices = ", ".join(sorted(WORK_PRESETS))
+        raise ValueError(f"unknown work preset {selected_preset!r}; choose one of: {choices}")
+
+    preset_values = WORK_PRESETS[selected_preset]
+    resolved_output_fps = float(preset_values["output_fps"])
+    resolved_input_fps = float(preset_values["input_fps"])
+
+    if env.get("FLUXRT_OUTPUT_FPS"):
+        resolved_output_fps = positive_float(env["FLUXRT_OUTPUT_FPS"], "FLUXRT_OUTPUT_FPS")
+    if env.get("FLUXRT_INPUT_FPS"):
+        resolved_input_fps = non_negative_float(env["FLUXRT_INPUT_FPS"], "FLUXRT_INPUT_FPS")
+
+    if output_fps is not None:
+        if output_fps <= 0:
+            raise ValueError("--output-fps must be positive")
+        resolved_output_fps = float(output_fps)
+    if input_fps is not None:
+        if input_fps < 0:
+            raise ValueError("--input-fps must be non-negative")
+        resolved_input_fps = float(input_fps)
+
+    return WorkConfig(
+        preset=selected_preset,
+        output_fps=resolved_output_fps,
+        input_fps=resolved_input_fps,
+    )
 
 
 class StageTimingWindow:
@@ -193,13 +287,19 @@ async def handle_ws(request: web.Request):
     app = request.app
     runner: FluxRTRunner = app["runner"]
     executor: ThreadPoolExecutor = app["executor"]
+    work_config: WorkConfig = app["work_config"]
 
     ws = web.WebSocketResponse(max_msg_size=20 * 1024 * 1024)  # 20MB, generous
                                                                 # headroom over
                                                                 # any single
                                                                 # JPEG frame
     await ws.prepare(request)
-    log.info("WebSocket client connected")
+    log.info(
+        "WebSocket client connected preset=%s output_fps=%.2f input_fps=%s",
+        work_config.preset,
+        work_config.output_fps,
+        "uncapped" if work_config.input_fps <= 0 else f"{work_config.input_fps:.2f}",
+    )
 
     loop = asyncio.get_event_loop()
 
@@ -207,7 +307,8 @@ async def handle_ws(request: web.Request):
     # in between, so the output tensor refreshes faster than that. A
     # separate sender task drains a latest-only slot, so slow network sends
     # drop stale encoded outputs instead of making a send queue.
-    output_interval = 1.0 / OUTPUT_FPS
+    output_interval = work_config.output_interval
+    input_interval = work_config.input_interval
 
     latest_input = {"buf": None}
     got_input = asyncio.Event()
@@ -268,16 +369,28 @@ async def handle_ws(request: web.Request):
     async def input_worker():
         # Consumes only the newest input JPEG and writes FluxRT's input tensor
         # from the worker pool, keeping decode/crop/copy off the event loop.
+        last_input_started_at: float | None = None
         try:
             while not stop_event.is_set():
                 await got_input.wait()
                 got_input.clear()
                 if stop_event.is_set():
                     break
+                if input_interval and last_input_started_at is not None:
+                    delay = max(
+                        0.0,
+                        last_input_started_at + input_interval - time.perf_counter(),
+                    )
+                    if delay:
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                    if stop_event.is_set():
+                        break
                 buf = latest_input["buf"]
                 latest_input["buf"] = None
                 if buf is None:
                     continue
+                last_input_started_at = time.perf_counter()
                 ok, timings = await loop.run_in_executor(
                     executor, runner.write_input_jpeg_timed, buf
                 )
@@ -443,7 +556,15 @@ async def executor_context(app: web.Application):
 async def handle_status(request: web.Request):
     app = request.app
     return web.json_response(
-        {"resolution": app["runner"].resolution, "transport": "websocket-tcp"}
+        {
+            "resolution": app["runner"].resolution,
+            "transport": "websocket-tcp",
+            "work": {
+                "preset": app["work_config"].preset,
+                "output_fps": app["work_config"].output_fps,
+                "input_fps": app["work_config"].input_fps,
+            },
+        }
     )
 
 
@@ -465,8 +586,11 @@ async def handle_prompt(request: web.Request):
     return web.json_response({"ok": True, "prompt": prompt})
 
 
-def create_app(config_path: str, use_int8: bool) -> web.Application:
+def create_app(
+    config_path: str, use_int8: bool, work_config: WorkConfig | None = None
+) -> web.Application:
     app = web.Application()
+    app["work_config"] = work_config or build_work_config()
     app["runner"] = FluxRTRunner(config_path, use_int8=use_int8)
     app.cleanup_ctx.append(executor_context)
     app.router.add_get("/ws", handle_ws)
@@ -485,9 +609,49 @@ def main():
     parser.add_argument("--int8", action="store_true", help="Enable int8 quantization")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--work-preset",
+        choices=sorted(WORK_PRESETS),
+        default=None,
+        help=(
+            "Server work preset. default preserves existing behavior; light/low "
+            "cap input writes and output reads for lower per-frame work. "
+            "Can also be set with FLUXRT_WORK_PRESET."
+        ),
+    )
+    parser.add_argument(
+        "--output-fps",
+        type=float,
+        default=None,
+        help="Server output tensor read/JPEG send cap. Overrides preset and FLUXRT_OUTPUT_FPS.",
+    )
+    parser.add_argument(
+        "--input-fps",
+        type=float,
+        default=None,
+        help=(
+            "FluxRT input tensor write cap. 0 means uncapped latest-wins input writes. "
+            "Overrides preset and FLUXRT_INPUT_FPS."
+        ),
+    )
     args = parser.parse_args()
 
-    app = create_app(args.config, args.int8)
+    try:
+        work_config = build_work_config(
+            preset=args.work_preset,
+            output_fps=args.output_fps,
+            input_fps=args.input_fps,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    log.info(
+        "work config preset=%s output_fps=%.2f input_fps=%s",
+        work_config.preset,
+        work_config.output_fps,
+        "uncapped" if work_config.input_fps <= 0 else f"{work_config.input_fps:.2f}",
+    )
+
+    app = create_app(args.config, args.int8, work_config=work_config)
     web.run_app(app, host=args.host, port=args.port)
 
 
