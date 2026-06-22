@@ -25,8 +25,7 @@ measure "how slow is FluxRT-over-TCP, really."
 Run:
     python server-tcp.py --config configs/stream_processor_config.json --port 8080
 
-Test against it with test_latency_client.py (sends a local video file or
-webcam frames, measures round-trip per frame, prints stats).
+Benchmark against it with benchmark_ws.py before opening TouchDesigner.
 """
 
 import argparse
@@ -91,6 +90,12 @@ class StageTimingWindow:
             "mean_ms": sum(samples) / len(samples),
             "p95_ms": ordered[p95_index],
         }
+
+
+def rate_per_second(count: int, elapsed_seconds: float) -> float:
+    if elapsed_seconds <= 0:
+        return 0.0
+    return count / elapsed_seconds
 
 
 class FluxRTRunner:
@@ -337,27 +342,40 @@ async def handle_ws(request: web.Request):
 
     async def stats_loop():
         last = stats.copy()
+        last_report_t = time.perf_counter()
         try:
             while not stop_event.is_set():
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop_event.wait(), timeout=5.0)
                 if stop_event.is_set():
                     break
+                now = time.perf_counter()
+                elapsed = now - last_report_t
+                last_report_t = now
                 delta = {k: stats[k] - last[k] for k in stats}
                 last = stats.copy()
                 timings = timing_window.snapshot()
                 log.info(
-                    "ws stats/5s rx=%d wrote=%d encoded=%d sent=%d "
+                    "ws stats/5s window=%.2fs "
+                    "rx=%d rx_fps=%.2f "
+                    "wrote=%d wrote_fps=%.2f "
+                    "encoded=%d encoded_fps=%.2f "
+                    "sent=%d sent_fps=%.2f "
                     "drop_in=%d drop_out=%d bad_decode=%d "
                     "hot_ms input_decode=%.2f/%.2f/%d "
                     "input_crop_copy=%.2f/%.2f/%d "
                     "output_read=%.2f/%.2f/%d "
                     "output_encode=%.2f/%.2f/%d "
                     "send=%.2f/%.2f/%d",
+                    elapsed,
                     delta["rx"],
+                    rate_per_second(delta["rx"], elapsed),
                     delta["input_written"],
+                    rate_per_second(delta["input_written"], elapsed),
                     delta["output_encoded"],
+                    rate_per_second(delta["output_encoded"], elapsed),
                     delta["sent"],
+                    rate_per_second(delta["sent"], elapsed),
                     delta["input_overwritten"],
                     delta["output_overwritten"],
                     delta["decode_failed"],

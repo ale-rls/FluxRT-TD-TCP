@@ -55,6 +55,10 @@ class StageTimingWindowTest(unittest.TestCase):
         self.assertEqual(snapshot["send"]["mean_ms"], 4.0)
         self.assertEqual(snapshot["send"]["p95_ms"], 4.0)
 
+    def test_rate_per_second_uses_elapsed_window(self):
+        self.assertEqual(server_tcp.rate_per_second(125, 5.0), 25.0)
+        self.assertEqual(server_tcp.rate_per_second(125, 0.0), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
