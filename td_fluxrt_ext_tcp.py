@@ -42,6 +42,7 @@ import json
 import socket
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 VERSION = "0.1.0-fluxrt-tcp"
@@ -291,6 +292,53 @@ class FluxRTExt:
         elif par.name == "Prompt":
             if self.state == "STREAMING":
                 self._send_prompt(par.eval())
+        elif par.name == "Serverurl":
+            self.InvalidateRelayCache()
+            if self.state == "STREAMING":
+                web_render = self.ownerComp.op('web_render')
+                if web_render:
+                    web_render.par.url = 'about:blank'
+                    web_render.par.url = f"http://localhost:{self.mjpeg_port}/relay.html"
+                self._send_prompt(self.params.Prompt)
+
+    def _normalized_urls(self, server_url):
+        """Return (ws_url, prompt_url) from either a WSS URL or HTTPS base."""
+        raw = (server_url or '').strip()
+        if not raw:
+            raw = PARAM_DEFAULTS['Serverurl']
+        if '://' not in raw:
+            raw = 'wss://' + raw
+
+        parsed = urllib.parse.urlparse(raw)
+        scheme = parsed.scheme.lower()
+        if scheme in ('http', 'https'):
+            ws_scheme = 'wss' if scheme == 'https' else 'ws'
+            http_scheme = scheme
+        elif scheme in ('ws', 'wss'):
+            ws_scheme = scheme
+            http_scheme = 'https' if scheme == 'wss' else 'http'
+        else:
+            ws_scheme = 'wss'
+            http_scheme = 'https'
+
+        path = parsed.path.rstrip('/')
+        if not path:
+            ws_path = '/ws'
+        elif path.endswith('/ws'):
+            ws_path = path
+        elif path.endswith('/prompt') or path.endswith('/status'):
+            ws_path = path.rsplit('/', 1)[0] + '/ws'
+        else:
+            ws_path = path + '/ws'
+
+        base_path = ws_path.rsplit('/ws', 1)[0] or ''
+        ws_url = urllib.parse.urlunparse(
+            (ws_scheme, parsed.netloc, ws_path, '', parsed.query, '')
+        )
+        prompt_url = urllib.parse.urlunparse(
+            (http_scheme, parsed.netloc, base_path + '/prompt', '', '', '')
+        )
+        return ws_url, prompt_url
 
     def _send_prompt(self, prompt):
         """POST the prompt directly to the server's /prompt endpoint.
@@ -305,12 +353,11 @@ class FluxRTExt:
         import threading
 
         server_url = self.params.Serverurl  # main-thread read
-        base = server_url.replace('wss://', 'https://').replace('ws://', 'http://')
-        base = base.rsplit('/', 1)[0]  # drop trailing '/ws'
-        prompt_url = base + '/prompt'
+        _ws_url, prompt_url = self._normalized_urls(server_url)
 
         def _post():
             import urllib.request
+            import urllib.parse
             import json as _json
             try:
                 req = urllib.request.Request(
@@ -319,7 +366,25 @@ class FluxRTExt:
                     headers={'Content-Type': 'application/json'},
                     method='POST',
                 )
-                urllib.request.urlopen(req, timeout=5)
+                try:
+                    urllib.request.urlopen(req, timeout=600)
+                except Exception as cert_error:
+                    parsed = urllib.parse.urlparse(prompt_url)
+                    modal_host = parsed.hostname and (
+                        parsed.hostname.endswith('.modal.run') or
+                        parsed.hostname.endswith('.modal.host')
+                    )
+                    if parsed.scheme != 'https' or not modal_host:
+                        raise
+                    import ssl
+                    urllib.request.urlopen(
+                        req, timeout=600,
+                        context=ssl._create_unverified_context(),
+                    )
+                    print(
+                        "FluxRT: prompt HTTPS certificate verification "
+                        f"failed in TD, retried unverified: {cert_error}"
+                    )
                 print(f"FluxRT: prompt updated -> {prompt!r}")
             except Exception as e:
                 print(f"FluxRT: prompt update failed: {e}")
@@ -378,7 +443,7 @@ class FluxRTExt:
 
     def _get_relay_html(self):
         if self._relay_html_cache is None:
-            remote_url = self.params.Serverurl
+            remote_url, _prompt_url = self._normalized_urls(self.params.Serverurl)
             html = RELAY_HTML_TEMPLATE.replace('{{LOCAL_WS_PORT}}', str(self.mjpeg_port))
             html = html.replace('{{REMOTE_WS_URL}}', remote_url)
             self._relay_html_cache = html.encode('utf-8')

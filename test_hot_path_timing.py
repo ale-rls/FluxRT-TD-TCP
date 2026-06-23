@@ -57,6 +57,13 @@ class FakeRunner:
         self.use_int8 = use_int8
         self.jpeg_config = jpeg_config
         self.resolution = {"width": 512, "height": 512}
+        self.config = {
+            "default_steps": 2,
+            "enable_spatial_cache": False,
+            "interpolation_exp": 1,
+            "target_fps": None,
+            "resolution": self.resolution,
+        }
         self.prompts = []
 
     def set_prompt(self, prompt):
@@ -158,6 +165,28 @@ class WorkConfigTest(unittest.TestCase):
                     )
                 with self.assertRaises(ValueError):
                     server_tcp.build_work_config(input_fps=float(value), environ={})
+
+
+class PromptConfigTest(unittest.TestCase):
+    def test_source_preserving_prompt_wraps_short_style_prompt(self):
+        prompt = server_tcp.build_effective_prompt("a lego character")
+
+        self.assertTrue(prompt.startswith("Turn this camera image into a lego character."))
+        self.assertIn("Preserve the source camera feed", prompt)
+        self.assertIn("Do not replace the scene", prompt)
+
+    def test_source_preserving_prompt_keeps_existing_instruction_shape(self):
+        prompt = server_tcp.build_effective_prompt("Turn this image into oil painting.")
+
+        self.assertTrue(prompt.startswith("Turn this image into oil painting."))
+        self.assertIn("Preserve the source camera feed", prompt)
+
+    def test_raw_prompt_mode_leaves_prompt_unchanged(self):
+        prompt = server_tcp.build_effective_prompt(
+            "a lego character", source_preserve=False
+        )
+
+        self.assertEqual(prompt, "a lego character")
 
 
 class JpegConfigTest(unittest.TestCase):
@@ -265,6 +294,16 @@ class FluxRTServerLifecycleTest(unittest.TestCase):
                 "jpeg": {
                     "output_quality": 55,
                 },
+                "fluxrt": {
+                    "default_steps": 2,
+                    "enable_spatial_cache": False,
+                    "interpolation_exp": 1,
+                    "target_fps": None,
+                    "resolution": {"width": 512, "height": 512},
+                },
+                "prompt": {
+                    "source_preserve": True,
+                },
             },
         )
 
@@ -278,8 +317,17 @@ class FluxRTServerLifecycleTest(unittest.TestCase):
         finally:
             server.shutdown_executor()
 
-        self.assertEqual(response["data"], {"ok": True, "prompt": "new prompt"})
-        self.assertEqual(server.runner.prompts, ["new prompt"])
+        self.assertEqual(response["data"]["ok"], True)
+        self.assertEqual(response["data"]["prompt"], "new prompt")
+        self.assertEqual(response["data"]["source_preserve"], True)
+        self.assertEqual(
+            response["data"]["effective_prompt"],
+            server_tcp.build_effective_prompt("new prompt"),
+        )
+        self.assertEqual(
+            server.runner.prompts,
+            [server_tcp.build_effective_prompt("new prompt")],
+        )
 
 
 if __name__ == "__main__":

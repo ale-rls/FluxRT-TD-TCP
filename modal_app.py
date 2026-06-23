@@ -53,6 +53,15 @@ SERVER_WORK_PRESET = "default"
 SERVER_OUTPUT_FPS = None
 SERVER_INPUT_FPS = None
 SERVER_OUTPUT_JPEG_QUALITY = 70
+SERVER_SOURCE_PRESERVE_PROMPTS = True
+
+# FluxRT model/runtime tuning. Upstream defaults interpolation_exp to 2, which
+# gives 4 output frames per generated frame and can smear fast camera motion.
+FLUXRT_INTERPOLATION_EXP = 1
+# Prioritize source-frame adherence while debugging TD. Spatial cache is faster,
+# but it can reuse stale image tokens across frames.
+FLUXRT_ENABLE_SPATIAL_CACHE = False
+FLUXRT_DEFAULT_STEPS = 2
 
 # Region for the GPU container. A narrow region has Modal's higher regional
 # pricing multiplier but avoids a US GPU hop for Berlin/EU clients. Set to None
@@ -202,6 +211,7 @@ def serve_tunnel():
 
 def _start_fluxrt_server():
     """Symlink weights and start the FluxRT aiohttp server."""
+    import json
     import os
     import subprocess
 
@@ -212,9 +222,25 @@ def _start_fluxrt_server():
         if os.path.isdir(src) and not os.path.lexists(dst):
             os.symlink(src, dst)
 
+    config_path = os.path.join(FLUXRT_DIR, "configs/stream_processor_config.json")
+    with open(config_path, "r") as config_file:
+        config = json.load(config_file)
+    config["interpolation_exp"] = FLUXRT_INTERPOLATION_EXP
+    config["enable_spatial_cache"] = FLUXRT_ENABLE_SPATIAL_CACHE
+    config["default_steps"] = FLUXRT_DEFAULT_STEPS
+    with open(config_path, "w") as config_file:
+        json.dump(config, config_file, indent=4)
+        config_file.write("\n")
+    print(
+        "[fluxrt] "
+        f"interpolation_exp={FLUXRT_INTERPOLATION_EXP} "
+        f"enable_spatial_cache={FLUXRT_ENABLE_SPATIAL_CACHE} "
+        f"default_steps={FLUXRT_DEFAULT_STEPS}"
+    )
+
     cmd = [
         "python", "server-tcp.py",
-        "--config", "configs/stream_processor_config.json",
+        "--config", config_path,
         "--port", str(PORT),
         "--work-preset", SERVER_WORK_PRESET,
     ]
@@ -224,6 +250,8 @@ def _start_fluxrt_server():
         cmd.extend(["--input-fps", str(SERVER_INPUT_FPS)])
     if SERVER_OUTPUT_JPEG_QUALITY is not None:
         cmd.extend(["--output-jpeg-quality", str(SERVER_OUTPUT_JPEG_QUALITY)])
+    if not SERVER_SOURCE_PRESERVE_PROMPTS:
+        cmd.append("--raw-prompts")
     if USE_INT8:
         cmd.append("--int8")
     # server-tcp.py binds 0.0.0.0 by default — required for web_server.

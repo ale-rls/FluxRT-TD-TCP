@@ -218,11 +218,15 @@ drop the warm container.
 - **Tuning.** Server-side cadence presets live near the top of `modal_app.py`:
   `SERVER_WORK_PRESET = "default"`, `"light"`, or `"low"`, with optional
   `SERVER_OUTPUT_FPS` and `SERVER_INPUT_FPS` overrides. Server output JPEG
-  quality is `SERVER_OUTPUT_JPEG_QUALITY`, default `70`. FluxRT model tuning
-  (`interpolation_exp`, `target_fps`, `resolution`) still lives in
-  `configs/stream_processor_config.json` inside the FluxRT clone. To override
-  FluxRT's own config, edit a local copy and add it to the image
-  (`.add_local_file(...)` in `modal_app.py`), then redeploy.
+  quality is `SERVER_OUTPUT_JPEG_QUALITY`, default `70`. Prompt updates are
+  source-preserving by default through `SERVER_SOURCE_PRESERVE_PROMPTS`.
+  Modal also overrides FluxRT's upstream config through
+  `FLUXRT_INTERPOLATION_EXP` (`1`, 2x RIFE), `FLUXRT_ENABLE_SPATIAL_CACHE`
+  (`False`, stronger per-frame camera conditioning while debugging), and
+  `FLUXRT_DEFAULT_STEPS` (`2`). Other FluxRT model tuning (`target_fps`,
+  `resolution`) still lives in `configs/stream_processor_config.json` inside
+  the FluxRT clone. To override those values, edit a local copy and add it to
+  the image (`.add_local_file(...)` in `modal_app.py`), then redeploy.
 - **No HF token needed** — all FluxRT model repos are public. If one ever goes
   gated, add a `modal.Secret` with `HF_TOKEN` and pass it to `download_weights`.
 - **CUDA image tag.** If `nvidia/cuda:12.8.0-devel-ubuntu22.04` fails to pull,

@@ -81,6 +81,21 @@ HOT_PATH_STAGES = (
     "send",
 )
 
+SOURCE_PRESERVE_SUFFIX = (
+    "Preserve the source camera feed: same subject, pose, silhouette, camera "
+    "angle, framing, composition, background layout, and lighting direction. "
+    "Do not replace the scene with an unrelated image."
+)
+SOURCE_PROMPT_STARTS = (
+    "turn ",
+    "transform ",
+    "convert ",
+    "make ",
+    "restyle ",
+    "preserve ",
+    "repeat ",
+)
+
 
 @dataclass(frozen=True)
 class WorkConfig:
@@ -106,6 +121,19 @@ class JpegConfig:
     @property
     def output_encode_params(self) -> list[int]:
         return [cv2.IMWRITE_JPEG_QUALITY, self.output_quality]
+
+
+def build_effective_prompt(prompt: str, *, source_preserve: bool = True) -> str:
+    prompt = prompt.strip()
+    if not source_preserve:
+        return prompt
+
+    lower = prompt.lower()
+    if lower.startswith(SOURCE_PROMPT_STARTS) or "this image" in lower:
+        base = prompt.rstrip(".")
+    else:
+        base = f"Turn this camera image into {prompt}"
+    return f"{base}. {SOURCE_PRESERVE_SUFFIX}"
 
 
 def jpeg_quality(value: str | int, name: str) -> int:
@@ -255,6 +283,7 @@ class FluxRTRunner:
         if use_int8:
             self.processor.enable_quantization()
         self.processor.start()
+        self.config = getattr(self.processor, "config", {})
 
         log.info("Waiting for FluxRT subprocess pipeline to warm up...")
         while not self.processor.is_ready():
@@ -419,11 +448,22 @@ class FluxRTWebSocketSession:
                         continue
 
                     if "prompt" in data:
-                        await self.loop.run_in_executor(
-                            self.executor, self.runner.set_prompt, data["prompt"]
+                        effective_prompt = await self.loop.run_in_executor(
+                            self.executor, self.server.set_prompt, data["prompt"]
                         )
                         async with self.send_lock:
-                            await self.ws.send_str(json.dumps({"ok": True}))
+                            await self.ws.send_str(
+                                json.dumps(
+                                    {
+                                        "ok": True,
+                                        "prompt": data["prompt"],
+                                        "effective_prompt": effective_prompt,
+                                        "source_preserve": (
+                                            self.server.source_preserve_prompts
+                                        ),
+                                    }
+                                )
+                            )
 
                 elif msg.type == WSMsgType.ERROR:
                     log.error(f"WebSocket closed with exception {self.ws.exception()}")
@@ -630,9 +670,11 @@ class FluxRTServer:
         work_config: WorkConfig | None = None,
         jpeg_config: JpegConfig | None = None,
         runner_factory: Callable[..., FluxRTRunner] = FluxRTRunner,
+        source_preserve_prompts: bool = True,
     ):
         self.work_config = work_config or build_work_config()
         self.jpeg_config = jpeg_config or build_jpeg_config()
+        self.source_preserve_prompts = source_preserve_prompts
         self.runner = runner_factory(
             config_path, use_int8=use_int8, jpeg_config=self.jpeg_config
         )
@@ -680,6 +722,13 @@ class FluxRTServer:
     async def handle_ws(self, request: web.Request):
         return await FluxRTWebSocketSession(request, self).run()
 
+    def set_prompt(self, prompt: str) -> str:
+        effective_prompt = build_effective_prompt(
+            prompt, source_preserve=self.source_preserve_prompts
+        )
+        self.runner.set_prompt(effective_prompt)
+        return effective_prompt
+
     async def handle_status(self, request: web.Request):
         return web.json_response(
             {
@@ -692,6 +741,20 @@ class FluxRTServer:
                 },
                 "jpeg": {
                     "output_quality": self.jpeg_config.output_quality,
+                },
+                "fluxrt": {
+                    key: self.runner.config.get(key)
+                    for key in (
+                        "default_steps",
+                        "enable_spatial_cache",
+                        "interpolation_exp",
+                        "target_fps",
+                        "resolution",
+                    )
+                    if key in self.runner.config
+                },
+                "prompt": {
+                    "source_preserve": self.source_preserve_prompts,
                 },
             }
         )
@@ -709,10 +772,17 @@ class FluxRTServer:
         if not prompt:
             return web.json_response({"error": "missing 'prompt'"}, status=400)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            self.require_executor(), self.runner.set_prompt, prompt
+        effective_prompt = await loop.run_in_executor(
+            self.require_executor(), self.set_prompt, prompt
         )
-        return web.json_response({"ok": True, "prompt": prompt})
+        return web.json_response(
+            {
+                "ok": True,
+                "prompt": prompt,
+                "effective_prompt": effective_prompt,
+                "source_preserve": self.source_preserve_prompts,
+            }
+        )
 
 
 def create_app(
@@ -720,9 +790,14 @@ def create_app(
     use_int8: bool,
     work_config: WorkConfig | None = None,
     jpeg_config: JpegConfig | None = None,
+    source_preserve_prompts: bool = True,
 ) -> web.Application:
     return FluxRTServer(
-        config_path, use_int8=use_int8, work_config=work_config, jpeg_config=jpeg_config
+        config_path,
+        use_int8=use_int8,
+        work_config=work_config,
+        jpeg_config=jpeg_config,
+        source_preserve_prompts=source_preserve_prompts,
     ).create_app()
 
 
@@ -771,6 +846,14 @@ def main():
             "be set with FLUXRT_OUTPUT_JPEG_QUALITY."
         ),
     )
+    parser.add_argument(
+        "--raw-prompts",
+        action="store_true",
+        help=(
+            "Send prompts to FluxRT exactly as received. By default prompts "
+            "are wrapped to preserve the input camera image."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -791,7 +874,11 @@ def main():
     )
 
     app = create_app(
-        args.config, args.int8, work_config=work_config, jpeg_config=jpeg_config
+        args.config,
+        args.int8,
+        work_config=work_config,
+        jpeg_config=jpeg_config,
+        source_preserve_prompts=not args.raw_prompts,
     )
     web.run_app(app, host=args.host, port=args.port)
 

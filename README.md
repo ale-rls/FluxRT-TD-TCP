@@ -148,18 +148,26 @@ def onValueChange(par, prev):
 
 ## Tuning
 
-In `configs/stream_processor_config.json`:
+In `configs/stream_processor_config.json` for a direct FluxRT run, or
+`FLUXRT_INTERPOLATION_EXP` in `modal_app.py` for Modal:
 
 - **`interpolation_exp`** — RIFE interpolation strength. `2` means 4× frame
   multiplication; high values look smooth in still moments but cause warping
   distortion during motion. **`1` (2×) is a good default** for content with
   movement. *(Requires server restart.)*
+- **`enable_spatial_cache`** — FluxRT's token cache. It improves speed, but
+  while validating TD camera adherence, turning it off gives every frame a
+  full image-conditioning pass. Modal defaults this to off in `modal_app.py`.
 - **`target_fps`** — set explicitly (e.g. `25`) to even out interpolated
   playback pacing.
 - **`resolution`** — higher costs more per frame; the model is the bottleneck.
 
 In `server-tcp.py` / `fluxrt_tcp_relay.html`:
 
+- **Source-preserving prompts** — by default, the server rewrites short style
+  prompts like `a lego character` into an image-editing instruction that
+  preserves the live camera subject, pose, framing, and background layout. Use
+  `--raw-prompts` only when you want FluxRT to receive exactly the prompt text.
 - **Server work preset** — start the server with
   `--work-preset default|light|low`, or set `FLUXRT_WORK_PRESET`. `default`
   preserves the original 25fps output loop and uncapped latest-wins input
