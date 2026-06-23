@@ -92,14 +92,17 @@ python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
 ```
 
 The script reports client-observed send/receive FPS over the active send
-window, plus `latest_send_age_ms` mean/p50/p95/max. Connection setup and
-post-send receive drain are shown in elapsed time but do not dilute the headline
-FPS. Since the server protocol does not tag frames and FluxRT input/output loops
-are decoupled, this is not a strict per-input model RTT; compare it with the
-backend's 5-second `ws stats/5s` `hot_ms` summaries to separate websocket
-pressure from server decode/crop/read/encode/send costs. Run the same command
-against the optional tunnel URL to compare `modal.run` and `modal.host` before
-opening TouchDesigner.
+window, plus `latest_send_age_active_ms` mean/p50/p95/max for responses that
+arrive during that active send window. It also prints receive-drain and combined
+latest-send-age summaries for diagnosing tail behavior after sending stops.
+Connection setup and post-send receive drain are shown in elapsed time but do
+not dilute the headline FPS or active latency numbers. Since the server
+protocol does not tag frames and FluxRT input/output loops are decoupled, this
+is not a strict per-input model RTT; compare it with the backend's 5-second
+`ws stats/5s` `hot_ms` summaries to separate websocket pressure from server
+decode/crop/read/encode/send costs. Run the same command against the optional
+tunnel URL to compare `modal.run` and `modal.host` before opening
+TouchDesigner.
 
 For a lower-work comparison, set `SERVER_WORK_PRESET = "light"` in
 `modal_app.py`, then `modal serve modal_app.py` or `modal deploy modal_app.py`
@@ -110,14 +113,14 @@ python3 benchmark_ws.py wss://<workspace>--fluxrt-tcp-serve.modal.run/ws \
   --benchmark-preset light --duration 30
 ```
 
-Compare each run's client `send_fps`, `receive_fps`, and `latest_send_age_ms`
-p50/p95 with the server `ws stats/5s` line: `rx_fps` vs. `wrote_fps`,
-`encoded_fps` vs. `sent_fps`, `drop_in`, `drop_out`, `avg_kb`, and `hot_ms`
-means/p95s. Use the lighter preset for TouchDesigner only if the benchmark
-improves latency or steadiness enough to justify the lower send/display
-cadence. All benchmark presets keep the real TouchDesigner relay geometry,
-512x512; use explicit `--width` and `--height` only for a separate
-JPEG/network/decode experiment.
+Compare each run's client `send_fps`, `receive_fps`, and
+`latest_send_age_active_ms` p50/p95 with the server `ws stats/5s` line:
+`rx_fps` vs. `wrote_fps`, `encoded_fps` vs. `sent_fps`, `drop_in`, `drop_out`,
+`avg_kb`, and `hot_ms` means/p95s. Use the lighter preset for TouchDesigner
+only if the benchmark improves latency or steadiness enough to justify the
+lower send/display cadence. All benchmark presets keep the real TouchDesigner
+relay geometry, 512x512; use explicit `--width` and `--height` only for a
+separate JPEG/network/decode experiment.
 
 For JPEG CPU/byte sweeps, keep cadence fixed and vary only quality. Set
 `SERVER_OUTPUT_JPEG_QUALITY = 70`, `60`, or `55` in `modal_app.py`, redeploy,
