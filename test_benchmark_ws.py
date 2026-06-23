@@ -37,6 +37,10 @@ class BenchmarkWsHelpersTest(unittest.TestCase):
         self.assertEqual(summary["avg_sent_frame_bytes"], 100.0)
         self.assertEqual(summary["avg_received_frame_bytes"], 200.0)
         self.assertEqual(summary["sent_minus_received_frames"], 1)
+        self.assertEqual(summary["latency_kind"], "latest_send_age_active_ms")
+        self.assertEqual(summary["latest_send_age_active_ms"]["count"], 1)
+        self.assertEqual(summary["latest_send_age_active_ms"]["mean_ms"], 250.0)
+        self.assertEqual(summary["latest_send_age_drain_ms"]["count"], 0)
         self.assertEqual(summary["latest_send_age_ms"]["count"], 1)
         self.assertEqual(summary["latest_send_age_ms"]["mean_ms"], 250.0)
 
@@ -78,6 +82,11 @@ class BenchmarkWsHelpersTest(unittest.TestCase):
         self.assertEqual(summary["frames_received_during_send"], 1)
         self.assertEqual(summary["receive_fps"], 1.0)
         self.assertEqual(summary["sent_minus_received_frames"], -1)
+        self.assertEqual(summary["latest_send_age_active_ms"]["count"], 1)
+        self.assertEqual(summary["latest_send_age_active_ms"]["mean_ms"], 500.0)
+        self.assertEqual(summary["latest_send_age_drain_ms"]["count"], 1)
+        self.assertEqual(summary["latest_send_age_drain_ms"]["mean_ms"], 2000.0)
+        self.assertEqual(summary["latest_send_age_ms"]["count"], 2)
 
     def test_parse_args_validates_benchmark_inputs(self):
         args = benchmark_ws.parse_args(

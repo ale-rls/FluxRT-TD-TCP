@@ -98,6 +98,8 @@ class BenchmarkRecorder:
     send_ended_at: float | None = None
     receive_started_at: float | None = None
     receive_ended_at: float | None = None
+    latest_send_age_active_samples: list[float] = field(default_factory=list)
+    latest_send_age_drain_samples: list[float] = field(default_factory=list)
 
     def start_send_window(self, now: float):
         self.send_started_at = now
@@ -120,11 +122,17 @@ class BenchmarkRecorder:
     def mark_received(self, now: float, size: int):
         self._mark_event(now)
         self.received += 1
-        if self.send_ended_at is None:
+        during_send = self.send_ended_at is None
+        if during_send:
             self.received_during_send += 1
         self.bytes_received += size
         if self.latest_send_at is not None:
-            self.latest_send_age_samples.append(now - self.latest_send_at)
+            age = now - self.latest_send_at
+            self.latest_send_age_samples.append(age)
+            if during_send:
+                self.latest_send_age_active_samples.append(age)
+            else:
+                self.latest_send_age_drain_samples.append(age)
 
     def _mark_event(self, now: float):
         if self.first_event_at is None:
@@ -163,12 +171,19 @@ class BenchmarkRecorder:
                 self.bytes_received, self.received
             ),
             "sent_minus_received_frames": self.sent - self.received,
-            "latency_kind": "latest_send_age_ms",
+            "latency_kind": "latest_send_age_active_ms",
+            "latest_send_age_active_ms": summarize_ms(
+                self.latest_send_age_active_samples
+            ),
+            "latest_send_age_drain_ms": summarize_ms(
+                self.latest_send_age_drain_samples
+            ),
             "latest_send_age_ms": summarize_ms(self.latest_send_age_samples),
             "protocol_note": (
                 "Frames are untagged and server input/output loops are "
-                "decoupled; latency is age since the latest client send when "
-                "a binary response arrived, not a strict per-input model RTT."
+                "decoupled; active latency is age since the latest client send "
+                "when a binary response arrived during the send window, not a "
+                "strict per-input model RTT."
             ),
         }
 
@@ -373,7 +388,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
 
 
 def print_text_summary(summary: dict):
-    latency = summary["latest_send_age_ms"]
+    active_latency = summary["latest_send_age_active_ms"]
+    drain_latency = summary["latest_send_age_drain_ms"]
+    combined_latency = summary["latest_send_age_ms"]
     print(
         "preset={benchmark_preset} frame={frame_width}x{frame_height} "
         "requested_send_fps={requested_send_fps:.2f} quality={jpeg_quality}".format(
@@ -395,8 +412,22 @@ def print_text_summary(summary: dict):
         "avg_received_frame={avg_received_frame_bytes:.0f}".format(**summary)
     )
     print(
-        "latest_send_age_ms count={count} mean={mean_ms:.2f} "
-        "p50={p50_ms:.2f} p95={p95_ms:.2f} max={max_ms:.2f}".format(**latency)
+        "latest_send_age_active_ms count={count} mean={mean_ms:.2f} "
+        "p50={p50_ms:.2f} p95={p95_ms:.2f} max={max_ms:.2f}".format(
+            **active_latency
+        )
+    )
+    print(
+        "latest_send_age_drain_ms count={count} mean={mean_ms:.2f} "
+        "p50={p50_ms:.2f} p95={p95_ms:.2f} max={max_ms:.2f}".format(
+            **drain_latency
+        )
+    )
+    print(
+        "latest_send_age_combined_ms count={count} mean={mean_ms:.2f} "
+        "p50={p50_ms:.2f} p95={p95_ms:.2f} max={max_ms:.2f}".format(
+            **combined_latency
+        )
     )
     print(summary["protocol_note"])
 

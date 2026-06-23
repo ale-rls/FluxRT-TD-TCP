@@ -238,16 +238,19 @@ overrides and label that run separately from cadence tuning.
 Client output reports elapsed time, active send/receive windows, frames
 sent/received, send/receive FPS for the active send window, byte totals,
 average frame bytes, the simple `sent_minus_received` count delta, and
-`latest_send_age_ms` mean/p50/p95/max. Connection setup and post-send receive
-drain do not dilute the headline FPS numbers. Because the server protocol
-intentionally does not tag frames and FluxRT input/output loops are decoupled,
-that latency is the age since the latest client send when a binary response
-arrived, not a strict per-input model round trip. Pair it with the server's
-`ws stats/5s` `hot_ms` fields to separate network pressure, server
-CPU/shared-memory costs, and FluxRT output cadence across runs. Compare
-baseline vs. `light` before opening TouchDesigner:
+`latest_send_age_active_ms` mean/p50/p95/max for responses that arrive during
+the active send window. It also prints receive-drain and combined
+latest-send-age summaries for diagnosing tail behavior after sending stops.
+Connection setup and post-send receive drain do not dilute the headline FPS or
+active latency numbers. Because the server protocol intentionally does not tag
+frames and FluxRT input/output loops are decoupled, active latest-send-age is
+the age since the latest client send when a binary response arrived, not a
+strict per-input model round trip. Pair it with the server's `ws stats/5s`
+`hot_ms` fields to separate network pressure, server CPU/shared-memory costs,
+and FluxRT output cadence across runs. Compare baseline vs. `light` before
+opening TouchDesigner:
 
-- Client: `send_fps`, `receive_fps`, and `latest_send_age_ms` p50/p95.
+- Client: `send_fps`, `receive_fps`, and `latest_send_age_active_ms` p50/p95.
 - Server: `rx_fps` vs. `wrote_fps`, `encoded_fps` vs. `sent_fps`, `drop_in`,
   `drop_out`, `avg_kb`, and the `hot_ms` stage means/p95s.
 
@@ -267,9 +270,9 @@ python3 benchmark_ws.py ws://127.0.0.1:8080/ws \
 ```
 
 For each run, record the benchmark's `input_jpeg`, average sent/received frame
-bytes, `receive_fps`, and `latest_send_age_ms` p95, then pair it with server
-`avg_kb`, `input_decode`, `output_encode`, `sent_fps`, and `send` p95. In
-TouchDesigner, match the client-side part of the run by setting **Input JPEG
-Quality** to the same `quality / 100` value, for example `0.55`.
+bytes, `receive_fps`, and `latest_send_age_active_ms` p95, then pair it with
+server `avg_kb`, `input_decode`, `output_encode`, `sent_fps`, and `send` p95.
+In TouchDesigner, match the client-side part of the run by setting **Input
+JPEG Quality** to the same `quality / 100` value, for example `0.55`.
 
 ---
