@@ -162,9 +162,8 @@ def download_weights():
     # A WS connection is one input that lives for the whole show; give it
     # plenty of room. The relay auto-reconnects if a connection is recycled.
     timeout=60 * 60 * 6,
-    # Stay warm for 20 min (Modal's max) after the last client disconnects,
-    # so a soundcheck -> show gap doesn't trigger a cold reload.
-    scaledown_window=60 * 20,
+    # Stay warm briefly after the last client disconnects, then scale to zero.
+    scaledown_window=60,
     # 0 = scale to zero when idle (no standing cost). Set to 1 before a live
     # show to keep a GPU pre-warmed and avoid a cold start mid-performance.
     min_containers=0,
@@ -189,7 +188,7 @@ def serve():
     region=GPU_REGION,
     volumes={WEIGHTS_DIR: weights},
     timeout=60 * 60 * 6,
-    scaledown_window=60 * 20,
+    scaledown_window=60,
     max_containers=1,
 )
 def serve_tunnel():

@@ -193,8 +193,8 @@ performance you don't want a cold start mid-show:
 - just keep `modal serve modal_app.py` running for the whole session — the
   container stays warm as long as that command is alive.
 
-`scaledown_window` is 20 min, so brief disconnects (soundcheck → show) won't
-drop the warm container.
+`scaledown_window` is 60 seconds, so idle containers shut down quickly after
+the last TD/browser connection closes.
 
 ## Notes & caveats
 
