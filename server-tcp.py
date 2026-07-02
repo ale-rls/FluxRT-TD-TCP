@@ -39,7 +39,6 @@ import json
 import logging
 import math
 import os
-import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -287,7 +286,14 @@ def parse_client_text_message(raw: str) -> dict | None:
 class FluxRTRunner:
     """Same wrapper as in server.py — kept identical on purpose so any
     latency difference we measure is attributable to transport, not to
-    a different FluxRT integration."""
+    a different FluxRT integration.
+
+    Deliberately unsynchronized: write_input/read_output touch two
+    DIFFERENT decoupled shared-memory tensors (see the note below), so
+    they may run concurrently on separate executor threads, and
+    set_prompt is delegated to FluxRT's own subprocess IPC. Serializing
+    them here would reintroduce the input/output coupling this design
+    exists to avoid."""
 
     def __init__(
         self,
@@ -295,7 +301,6 @@ class FluxRTRunner:
         use_int8: bool = False,
         jpeg_config: JpegConfig | None = None,
     ):
-        self._lock = threading.Lock()
         self.jpeg_config = jpeg_config or build_jpeg_config()
         self._output_jpeg_encode_params = self.jpeg_config.output_encode_params
         from fluxrt import StreamProcessor
