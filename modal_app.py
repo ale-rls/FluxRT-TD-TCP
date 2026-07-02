@@ -139,6 +139,7 @@ def download_weights():
     USE_INT8 to pull the int8 weights too.
     """
     import os
+    import shutil
     import subprocess
 
     subprocess.run(["git", "lfs", "install"], check=True)
@@ -147,8 +148,17 @@ def download_weights():
         if os.path.isdir(dest):
             print(f"[weights] {name} already present, skipping")
             continue
+        # Clone into a temp dir and rename only on success: a clone
+        # interrupted mid-download (timeout, ctrl-c, container kill)
+        # must not leave a partial dir that later runs skip as
+        # "already present". The rename makes completion atomic.
+        partial = dest + ".partial"
+        if os.path.isdir(partial):
+            print(f"[weights] removing stale partial clone of {name}")
+            shutil.rmtree(partial)
         print(f"[weights] cloning {name} ...")
-        subprocess.run(["git", "clone", url, dest], check=True)
+        subprocess.run(["git", "clone", url, partial], check=True)
+        os.rename(partial, dest)
     weights.commit()
     print("[weights] done")
 
