@@ -283,6 +283,13 @@ def parse_client_text_message(raw: str) -> dict | None:
     return data
 
 
+def valid_prompt(value) -> bool:
+    """A usable prompt is a non-empty, non-whitespace string. Anything
+    else would produce a broken effective prompt ("Turn this camera
+    image into . ...") or raise inside set_prompt."""
+    return isinstance(value, str) and bool(value.strip())
+
+
 class FluxRTRunner:
     """Same wrapper as in server.py — kept identical on purpose so any
     latency difference we measure is attributable to transport, not to
@@ -477,6 +484,11 @@ class FluxRTWebSocketSession:
                         continue
 
                     if "prompt" in data:
+                        if not valid_prompt(data["prompt"]):
+                            log.warning(
+                                f"Ignoring invalid prompt: {data['prompt']!r}"
+                            )
+                            continue
                         # Apply the prompt in a background task: awaiting
                         # set_prompt inline here pauses the `async for`,
                         # so no input frames would be read while FluxRT
@@ -846,9 +858,11 @@ class FluxRTServer:
             data = await request.json()
         except Exception:
             return web.json_response({"error": "invalid json"}, status=400)
-        prompt = data.get("prompt")
-        if not prompt:
-            return web.json_response({"error": "missing 'prompt'"}, status=400)
+        prompt = data.get("prompt") if isinstance(data, dict) else None
+        if not valid_prompt(prompt):
+            return web.json_response(
+                {"error": "missing or invalid 'prompt'"}, status=400
+            )
         loop = asyncio.get_event_loop()
         effective_prompt = await loop.run_in_executor(
             self.require_executor(), self.set_prompt, prompt
