@@ -356,6 +356,8 @@ class FluxRTExt:
         _ws_url, prompt_url = self._normalized_urls(server_url)
 
         def _post():
+            import ssl
+            import urllib.error
             import urllib.request
             import urllib.parse
             import json as _json
@@ -367,18 +369,31 @@ class FluxRTExt:
                     method='POST',
                 )
                 try:
-                    urllib.request.urlopen(req, timeout=600)
-                except Exception as cert_error:
+                    urllib.request.urlopen(req, timeout=30)
+                except urllib.error.URLError as cert_error:
+                    # Retry unverified ONLY for certificate verification
+                    # failures against Modal hosts (TD's bundled Python
+                    # can lack their CA chain). Any other failure — HTTP
+                    # 4xx/5xx, timeout, connection refused — must
+                    # propagate instead of triggering a duplicate,
+                    # TLS-unverified POST of the same prompt.
                     parsed = urllib.parse.urlparse(prompt_url)
                     modal_host = parsed.hostname and (
                         parsed.hostname.endswith('.modal.run') or
                         parsed.hostname.endswith('.modal.host')
                     )
-                    if parsed.scheme != 'https' or not modal_host:
+                    cert_failure = isinstance(
+                        getattr(cert_error, 'reason', None),
+                        ssl.SSLCertVerificationError,
+                    )
+                    if (
+                        parsed.scheme != 'https'
+                        or not modal_host
+                        or not cert_failure
+                    ):
                         raise
-                    import ssl
                     urllib.request.urlopen(
-                        req, timeout=600,
+                        req, timeout=30,
                         context=ssl._create_unverified_context(),
                     )
                     print(
