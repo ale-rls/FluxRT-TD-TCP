@@ -167,6 +167,24 @@ class WorkConfigTest(unittest.TestCase):
                     server_tcp.build_work_config(input_fps=float(value), environ={})
 
 
+class ClientTextMessageTest(unittest.TestCase):
+    def test_json_object_is_returned(self):
+        self.assertEqual(
+            server_tcp.parse_client_text_message('{"prompt": "a forest"}'),
+            {"prompt": "a forest"},
+        )
+
+    def test_invalid_json_is_rejected(self):
+        self.assertIsNone(server_tcp.parse_client_text_message("not json"))
+
+    def test_non_object_json_is_rejected(self):
+        # These previously raised TypeError in the receiver, which tore
+        # down the entire streaming session.
+        for raw in ("123", "true", "null", '"prompt"', "[1, 2]"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(server_tcp.parse_client_text_message(raw))
+
+
 class PromptConfigTest(unittest.TestCase):
     def test_source_preserving_prompt_wraps_short_style_prompt(self):
         prompt = server_tcp.build_effective_prompt("a lego character")

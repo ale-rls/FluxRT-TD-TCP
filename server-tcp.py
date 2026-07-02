@@ -264,6 +264,26 @@ def rate_per_second(count: int, elapsed_seconds: float) -> float:
     return count / elapsed_seconds
 
 
+def parse_client_text_message(raw: str) -> dict | None:
+    """Parse a client text frame into a message dict, or None if unusable.
+
+    Clients only ever send JSON objects (e.g. {"prompt": ...}). Anything
+    else — invalid JSON, or valid JSON that is not an object (`123`,
+    `"prompt"`, `null`, ...) — must be rejected here rather than left to
+    raise in the receiver: an uncaught receiver error stops every worker
+    task and closes the whole streaming session.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning(f"Ignoring non-JSON text message: {raw!r}")
+        return None
+    if not isinstance(data, dict):
+        log.warning(f"Ignoring non-object text message: {raw!r}")
+        return None
+    return data
+
+
 class FluxRTRunner:
     """Same wrapper as in server.py — kept identical on purpose so any
     latency difference we measure is attributable to transport, not to
@@ -441,10 +461,8 @@ class FluxRTWebSocketSession:
                     self.got_input.set()
 
                 elif msg.type == WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
-                    except json.JSONDecodeError:
-                        log.warning(f"Ignoring non-JSON text message: {msg.data!r}")
+                    data = parse_client_text_message(msg.data)
+                    if data is None:
                         continue
 
                     if "prompt" in data:
