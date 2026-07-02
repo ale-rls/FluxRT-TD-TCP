@@ -178,8 +178,27 @@ def download_weights():
 def serve():
     """Launch server-tcp.py inside the container; Modal proxies HTTPS/WSS to
     PORT. Non-blocking (Popen) so Modal can detect the port once FluxRT has
-    finished warming up."""
-    _start_fluxrt_server()
+    finished warming up.
+
+    Modal only health-checks the port at startup, so if the server process
+    died later the container would sit there looking healthy while every
+    connection failed until scaledown. A watchdog thread exits the
+    container as soon as the server exits, so Modal replaces it (cold
+    start) on the next request instead of serving a black hole."""
+    import os
+    import threading
+
+    process = _start_fluxrt_server()
+
+    def _exit_container_when_server_dies():
+        code = process.wait()
+        print(f"[fluxrt] server-tcp.py exited with code {code}; "
+              "terminating container so Modal can replace it")
+        os._exit(code or 1)
+
+    threading.Thread(
+        target=_exit_container_when_server_dies, daemon=True
+    ).start()
 
 
 @app.function(
