@@ -697,6 +697,10 @@ class FluxRTServer:
             config_path, use_int8=use_int8, jpeg_config=self.jpeg_config
         )
         self._executor: ThreadPoolExecutor | None = None
+        # There is exactly ONE FluxRT pipeline (one shared input/output
+        # tensor pair) and the executor is sized for one session, so only
+        # one WebSocket client can stream at a time. See adopt_session().
+        self.active_session: "FluxRTWebSocketSession | None" = None
 
     @property
     def executor(self) -> ThreadPoolExecutor | None:
@@ -737,8 +741,36 @@ class FluxRTServer:
         finally:
             self.shutdown_executor()
 
+    def adopt_session(self, session) -> None:
+        """Make `session` the single active streaming session.
+
+        Concurrent clients would interleave frames into the one shared
+        FluxRT input tensor and contend for the two executor workers, so
+        a new connection preempts the existing one instead of sharing
+        with it. Preempting (rather than rejecting the newcomer) means a
+        stale relay page or forgotten browser tab can never lock the
+        live operator out — reconnecting always takes over.
+        """
+        previous = self.active_session
+        self.active_session = session
+        if previous is not None:
+            log.warning(
+                "New WebSocket client connected; preempting the previous "
+                "streaming session"
+            )
+            previous.stop_all()
+
+    def release_session(self, session) -> None:
+        if self.active_session is session:
+            self.active_session = None
+
     async def handle_ws(self, request: web.Request):
-        return await FluxRTWebSocketSession(request, self).run()
+        session = FluxRTWebSocketSession(request, self)
+        self.adopt_session(session)
+        try:
+            return await session.run()
+        finally:
+            self.release_session(session)
 
     def set_prompt(self, prompt: str) -> str:
         effective_prompt = build_effective_prompt(

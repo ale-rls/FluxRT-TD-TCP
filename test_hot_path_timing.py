@@ -325,6 +325,33 @@ class FluxRTServerLifecycleTest(unittest.TestCase):
             },
         )
 
+    def test_new_session_preempts_the_active_one(self):
+        class FakeSession:
+            def __init__(self):
+                self.stopped = False
+
+            def stop_all(self):
+                self.stopped = True
+
+        server = self.make_server()
+        first = FakeSession()
+        second = FakeSession()
+
+        server.adopt_session(first)
+        self.assertIs(server.active_session, first)
+        self.assertFalse(first.stopped)
+
+        server.adopt_session(second)
+        self.assertIs(server.active_session, second)
+        self.assertTrue(first.stopped)
+        self.assertFalse(second.stopped)
+
+        # The preempted session's cleanup must not clear the new one.
+        server.release_session(first)
+        self.assertIs(server.active_session, second)
+        server.release_session(second)
+        self.assertIsNone(server.active_session)
+
     def test_prompt_handler_uses_owned_executor_and_runner(self):
         server = self.make_server()
         server.start_executor()
