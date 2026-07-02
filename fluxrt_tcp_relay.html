@@ -125,6 +125,7 @@ let remoteWs = null;
 // always has a fresh frame, undersending would starve it.
 const SEND_FPS = 25;
 let lastSendTime = 0;
+let pumpStarted = false;
 
 function connectRemote() {
   setStatus("Connecting to FluxRT server...");
@@ -134,7 +135,14 @@ function connectRemote() {
   remoteWs.onopen = () => {
     setStatus("Connected, streaming...");
     setTimeout(hideStatus, 500);
-    pumpFrames();
+    // Start the send loop exactly once. pumpFrames re-schedules itself
+    // via requestAnimationFrame forever and already checks readyState,
+    // so starting it again on every reconnect would stack an extra
+    // endless rAF loop per reconnect.
+    if (!pumpStarted) {
+      pumpStarted = true;
+      pumpFrames();
+    }
   };
   remoteWs.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {
