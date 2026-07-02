@@ -333,8 +333,11 @@ class FluxRTExt:
         ws_url = urllib.parse.urlunparse(
             (ws_scheme, parsed.netloc, ws_path, '', parsed.query, '')
         )
+        # Carry the query through like ws_url does — if the server URL
+        # ever carries auth as a query string, both endpoints need it.
         prompt_url = urllib.parse.urlunparse(
-            (http_scheme, parsed.netloc, base_path + '/prompt', '', '', '')
+            (http_scheme, parsed.netloc, base_path + '/prompt', '',
+             parsed.query, '')
         )
         return ws_url, prompt_url
 
