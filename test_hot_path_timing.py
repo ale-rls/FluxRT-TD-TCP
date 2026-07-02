@@ -352,6 +352,27 @@ class FluxRTServerLifecycleTest(unittest.TestCase):
         server.release_session(second)
         self.assertIsNone(server.active_session)
 
+    def test_prompt_handler_rejects_missing_or_invalid_prompts(self):
+        server = self.make_server()
+        server.start_executor()
+        try:
+            for payload in ({}, {"prompt": ""}, {"prompt": "   "},
+                            {"prompt": 123}, {"prompt": None}, [1, 2], "text"):
+                with self.subTest(payload=payload):
+                    response = asyncio.run(
+                        server.handle_prompt(FakeJsonRequest(payload))
+                    )
+                    self.assertEqual(response["status"], 400)
+            self.assertEqual(server.runner.prompts, [])
+        finally:
+            server.shutdown_executor()
+
+    def test_valid_prompt_helper(self):
+        self.assertTrue(server_tcp.valid_prompt("a forest"))
+        for value in ("", "   ", None, 123, ["x"], {"p": 1}):
+            with self.subTest(value=value):
+                self.assertFalse(server_tcp.valid_prompt(value))
+
     def test_prompt_handler_uses_owned_executor_and_runner(self):
         server = self.make_server()
         server.start_executor()
