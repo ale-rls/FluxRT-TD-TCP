@@ -403,6 +403,7 @@ class FluxRTWebSocketSession:
         self.got_output = asyncio.Event()
         self.stop_event = asyncio.Event()
         self.send_lock = asyncio.Lock()
+        self.prompt_tasks: set[asyncio.Task] = set()
         self.timing_window = StageTimingWindow()
         self.stats = {
             "rx": 0,
@@ -443,8 +444,13 @@ class FluxRTWebSocketSession:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             self.stop_all()
+            pending_prompts = list(self.prompt_tasks)
+            for task in pending_prompts:
+                task.cancel()
             await self.ws.close()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                *tasks, *pending_prompts, return_exceptions=True
+            )
 
         log.info("WebSocket client disconnected")
         return self.ws
@@ -471,22 +477,16 @@ class FluxRTWebSocketSession:
                         continue
 
                     if "prompt" in data:
-                        effective_prompt = await self.loop.run_in_executor(
-                            self.executor, self.server.set_prompt, data["prompt"]
+                        # Apply the prompt in a background task: awaiting
+                        # set_prompt inline here pauses the `async for`,
+                        # so no input frames would be read while FluxRT
+                        # processes the prompt — a visible input hitch on
+                        # every prompt change.
+                        task = asyncio.create_task(
+                            self.apply_prompt(data["prompt"])
                         )
-                        async with self.send_lock:
-                            await self.ws.send_str(
-                                json.dumps(
-                                    {
-                                        "ok": True,
-                                        "prompt": data["prompt"],
-                                        "effective_prompt": effective_prompt,
-                                        "source_preserve": (
-                                            self.server.source_preserve_prompts
-                                        ),
-                                    }
-                                )
-                            )
+                        self.prompt_tasks.add(task)
+                        task.add_done_callback(self.prompt_tasks.discard)
 
                 elif msg.type == WSMsgType.ERROR:
                     log.error(f"WebSocket closed with exception {self.ws.exception()}")
@@ -497,6 +497,29 @@ class FluxRTWebSocketSession:
             log.exception("receiver error")
         finally:
             self.stop_all()
+
+    async def apply_prompt(self, prompt):
+        try:
+            effective_prompt = await self.loop.run_in_executor(
+                self.executor, self.server.set_prompt, prompt
+            )
+            async with self.send_lock:
+                await self.ws.send_str(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "prompt": prompt,
+                            "effective_prompt": effective_prompt,
+                            "source_preserve": (
+                                self.server.source_preserve_prompts
+                            ),
+                        }
+                    )
+                )
+        except (ConnectionResetError, RuntimeError):
+            pass
+        except Exception:
+            log.exception("prompt update error")
 
     async def input_worker(self):
         # Consumes only the newest input JPEG and writes FluxRT's input tensor
