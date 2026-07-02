@@ -313,7 +313,6 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
 
     jpeg = make_synthetic_jpeg(args.width, args.height, args.quality)
     recorder = BenchmarkRecorder()
-    send_done = asyncio.Event()
 
     timeout = aiohttp.ClientTimeout(total=args.duration + args.receive_drain + 30.0)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -345,7 +344,6 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
                 finally:
                     recorder.end_send_window(time.perf_counter())
                     recorder.end_receive_window(recorder.send_ended_at)
-                    send_done.set()
 
             async def receive_loop():
                 stop_at = benchmark_started_at + args.duration + args.receive_drain
@@ -367,8 +365,6 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
                         break
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         raise RuntimeError(f"websocket error: {ws.exception()}")
-                    elif send_done.is_set() and time.perf_counter() >= stop_at:
-                        break
 
             await asyncio.gather(send_loop(), receive_loop())
 
