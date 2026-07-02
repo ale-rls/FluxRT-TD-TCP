@@ -7,7 +7,6 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #000; width: 512px; height: 512px; overflow: hidden; }
   #output-canvas { width: 512px; height: 512px; display: block; }
-  #input-canvas { display: none; }
   #status {
     position: absolute; inset: 0; z-index: 101;
     display: flex; align-items: center; justify-content: center;
@@ -24,7 +23,6 @@
 </head>
 <body>
   <canvas id="output-canvas" width="512" height="512"></canvas>
-  <canvas id="input-canvas" width="512" height="512"></canvas>
   <div id="status"><div id="status-text">Connecting...</div></div>
 
 <script>
@@ -37,15 +35,15 @@
  * Two WebSocket connections, same bridging role the original relay had:
  *   1. LOCAL (to TD): receives input frames (JPEG) that TD's web_server
  *      DAT pushes from stream_source — identical mechanism to the
- *      original relay's input path. Painted onto #input-canvas.
+ *      original relay's input path. Kept as latestInputJpeg (latest-wins).
  *   2. REMOTE (to FluxRT server): the input frames are forwarded here as
  *      binary JPEG; processed JPEG frames come back and are painted onto
  *      #output-canvas, which web_render captures for display in TD.
  *
- * Self-throttling: a new frame is only forwarded to the remote server
- * once the previous processed frame has come back (FRAME_IN_FLIGHT flag).
- * Same reasoning as the TD-Python version — never flood the link, and
- * keep input/output frames unambiguously paired.
+ * Self-throttling: input frames are forwarded on a rate-capped
+ * requestAnimationFrame loop that only sends once the socket has drained
+ * the previous frame (bufferedAmount === 0), always sending the newest
+ * frame — never flood the link, never queue stale frames.
  *
  * Template variables filled in by the extension before serving:
  *   {{LOCAL_WS_PORT}} - TD's local web_server port (input frames in)
@@ -106,9 +104,7 @@ function drainPaint() {
     });
 }
 
-// --- Input canvas: latest input frame received from TD locally ---
-const inCanvas = document.getElementById("input-canvas");
-const inCtx = inCanvas.getContext("2d");
+// --- Latest input frame received from TD locally ---
 let latestInputJpeg = null; // ArrayBuffer of the most recent input frame
 
 // --- Remote connection (to FluxRT server) ---
