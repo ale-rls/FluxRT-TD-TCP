@@ -54,7 +54,6 @@ log = logging.getLogger("fluxrt-tcp-server")
 DEFAULT_OUTPUT_JPEG_QUALITY = 70  # cv2 expects 0-100; matches the 0.7
                                   # quality factor the original Daydream TD
                                   # extension used for its local MJPEG relay.
-JPEG_QUALITY = DEFAULT_OUTPUT_JPEG_QUALITY  # legacy module-level name
 OUTPUT_FPS = 25    # match FluxRT demo display pacing and the TD relay SEND_FPS
 
 WORK_PRESETS = {

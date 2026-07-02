@@ -38,12 +38,10 @@ the original — kept as a separate paste step so the large HTML block
 isn't error-prone to hand-edit inline).
 """
 
-import json
 import socket
 import threading
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 
 VERSION = "0.1.0-fluxrt-tcp"
 
